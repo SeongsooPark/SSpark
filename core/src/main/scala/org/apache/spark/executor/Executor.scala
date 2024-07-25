@@ -27,7 +27,7 @@ import java.util.concurrent._
 import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.{ArrayBuffer, HashMap, Map}
+import scala.collection.mutable.{ArrayBuffer, HashMap, Map, HashSet}
 import scala.concurrent.duration._
 import scala.util.control.NonFatal
 
@@ -71,6 +71,9 @@ private[spark] class Executor(
   private val EMPTY_BYTE_BUFFER = ByteBuffer.wrap(new Array[Byte](0))
 
   private val conf = env.conf
+
+  private val isSSparkProfileEnabled = conf.getBoolean("spark.ssparkProfile.enabled", false)
+  private val isSSparkLogEnabled = conf.getBoolean("spark.ssparkLog.enabled", false)
 
   // No ip or host:port - just hostname
   Utils.checkHost(executorHostname)
@@ -509,6 +512,20 @@ private[spark] class Executor(
         executorSource.METRIC_RESULT_SIZE.inc(task.metrics.resultSize)
         executorSource.METRIC_DISK_BYTES_SPILLED.inc(task.metrics.diskBytesSpilled)
         executorSource.METRIC_MEMORY_BYTES_SPILLED.inc(task.metrics.memoryBytesSpilled)
+
+        // SSPARK: calc block computing time per each task
+        if(isSSparkProfileEnabled){
+          val blockTime = task.metrics.calcBlockTime(isSSparkLogEnabled, taskId) 
+            // probably need to modify to previous version without infos for debuging
+            // val blockTime = task.metrics.calcBlockTime() 
+          val updatedBlockTime = task.metrics.toJavaList(blockTime)
+          val blockSize = task.metrics.blockSize
+          val updatedBlockSize = task.metrics.toJavaList(blockSize)
+          logInfoSSP(s"Time ${updatedBlockTime}", isSSparkLogEnabled)
+          logInfoSSP(s"Size ${updatedBlockSize}", isSSparkLogEnabled)
+          task.metrics.setUpdatedBlockTime(updatedBlockTime)
+          task.metrics.setUpdatedBlockSize(updatedBlockSize)
+        }
 
         // Note: accumulator updates must be collected after TaskMetrics is updated
         val accumUpdates = task.collectAccumulatorUpdates()

@@ -730,7 +730,8 @@ class TaskSetManagerSuite extends SparkFunSuite with LocalSparkContext with Logg
     assert(manager.runningTasks === 2)
     assert(manager.isZombie === false)
 
-    val directTaskResult = new DirectTaskResult[String](null, Seq()) {
+    val directTaskResult = new DirectTaskResult[String](null, Seq())
+    {
       override def value(resultSer: SerializerInstance): String = ""
     }
     // Complete one copy of the task, which should result in the task set manager

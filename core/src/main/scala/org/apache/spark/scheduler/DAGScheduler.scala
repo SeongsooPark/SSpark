@@ -16,6 +16,9 @@
  */
 
 package org.apache.spark.scheduler
+import java.nio.file.{Files, Paths}             //* 
+import java.io.{File, FileWriter}               // SSPARK
+import scala.collection.mutable.LinkedHashMap   //*
 
 import java.io.NotSerializableException
 import java.util.Properties
@@ -247,6 +250,9 @@ private[spark] class DAGScheduler(
 
   private[spark] val eventProcessLoop = new DAGSchedulerEventProcessLoop(this)
   taskScheduler.setDAGScheduler(this)
+
+  private val isSSparkLogEnabled = sc.getConf.getBoolean("spark.ssparkLog.enabled", false)
+  private val isSSparkProfileEnabled = sc.getConf.getBoolean("spark.ssparkProfile.enabled", false)
 
   /**
    * Called by the TaskSetManager to report task's starting.
@@ -1088,8 +1094,25 @@ private[spark] class DAGScheduler(
         val missing = getMissingParentStages(stage).sortBy(_.id)
         logDebug("missing: " + missing)
         if (missing.isEmpty) {
+          var selectCandidates: Option[Thread] = None
+          if (sc.isSSparkOptimizeEnabled) {
+            val thread = sc.createSelectCandidatesThread
+            thread.start
+          }
+          if (isSSparkProfileEnabled) 
+            sc.makeLineage(stage.id, stage.rdd)  // SSPARK: make lineage on each Stage
+          
           logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
           submitMissingTasks(stage, jobId.get)
+          val startJoin = System.currentTimeMillis()
+          selectCandidates.foreach(_.join())
+          val endJoin = System.currentTimeMillis()
+          val tTime = endJoin - startJoin
+          logInfoSSP(s"selectCandidates thread time: ${tTime}ms", isSSparkLogEnabled)
+          if (!isSSparkLogEnabled && tTime > 0){
+            logInfoSSP(s"selectCandidates thread time may have overhead: ${tTime}ms")
+          }
+
         } else {
           for (parent <- missing) {
             submitStage(parent)
@@ -1296,6 +1319,9 @@ private[spark] class DAGScheduler(
             e)
       }
     }
+    // SSPARK: may have null exception, just for checking consistency
+    //logInfoSSP(s"received BlockTime from task ${event.taskInfo.id} ${event.accumUpdates.find(a => a.name == Some(InternalAccumulator.BLOCK_TIME)).get.value}")
+    //logInfoSSP(s"received BlockSize from task ${event.taskInfo.id} ${event.accumUpdates.find(a => a.name == Some(InternalAccumulator.BLOCK_SIZE)).get.value}")
   }
 
   private def postTaskEnd(event: CompletionEvent): Unit = {
@@ -1862,6 +1888,381 @@ private[spark] class DAGScheduler(
     }
   }
 
+  /* 
+   *  SSPARK: A function that calculates the RDD size by merging the sizes of each block based on the RDD id.
+   */
+  private def blockSizeToRddSize(blockSize: java.util.List[(Int, Long)], stageId: Int): HashMap[Int, Long] ={
+    val lineage = sc.lineages.get(stageId).get
+    var rddSize = new HashMap[Int, Long]
+    for(i <- 0 to blockSize.size()-1) {
+      val cur = blockSize.get(i)
+      if (rddSize.contains(cur._1)) {
+        rddSize(cur._1) += cur._2
+      }
+      else {
+        if (lineage.contains(cur._1))
+          rddSize.put(cur._1, cur._2)
+        else
+          logErrorSSP(s"unrecognized BlockSize for rdd id ${cur._1} on stage ${stageId}")
+      }
+    }
+    rddSize
+  }
+  
+  /* 
+   *  SSPARK: A function that calculates the RDD time by merging the times of each block based on the RDD id.
+   *  This calculates the RDD computation time using a heuristic method. 
+   *  The absolute execution time of RDD cannot be obtained in Spark, a distributed environment.
+   *  We assume that the RDD time is the ratio of the calculation time of RDD blocks(tasks) 
+   *  to the total stage time using the following formula.
+   *  RDD time = sum times of corresponding blocks / sum times of all block times in the stage * time of stage
+   */
+  private def blockTimeToRddTime(blockTime: java.util.List[(Int, Long)], stageTime: Long, stageId: Int): HashMap[Int, Long] ={
+    val lineage = sc.lineages.get(stageId).get
+    var rddTime = new HashMap[Int, Long]
+    var sumBlockTime = 0L
+    for(i <- 0 to blockTime.size()-1) {
+      val cur = blockTime.get(i)
+      if(cur._1 == 0){ // only BlockTime has rdd 0, and it should be accumulated into rdd 1
+        if (rddTime.contains(1)) {
+          rddTime(1) += cur._2
+          sumBlockTime += cur._2
+        }
+        else {
+          rddTime.put(1, cur._2)
+          sumBlockTime += cur._2
+        }
+      }
+      else {
+        if (rddTime.contains(cur._1)) {
+          rddTime(cur._1) += cur._2
+          sumBlockTime += cur._2
+        }
+        else {
+          if (lineage.contains(cur._1)) {
+            rddTime.put(cur._1, cur._2)
+            sumBlockTime += cur._2
+          }
+          else
+            logErrorSSP(s"unrecognized BlockTime for rdd id ${cur._1} on stage ${stageId}")
+        }
+      }
+    }
+    rddTime = rddTime.map ( x => x._1 -> (x._2.toDouble / sumBlockTime.toDouble * stageTime.toDouble).toLong)
+    rddTime
+  }
+
+  /* 
+  *  SSPARK: A function that calculates and merges the profiled data
+  */
+  private def handleProfiled(stage: Stage): Unit = {
+    val accum = stage.latestInfo.accumulables
+    // may occur runtime error when submissionTime or completionTime is not set
+    var rddTime = new HashMap[Int, Long]
+    var rddSize = new HashMap[Int, Long]
+
+    val stageNanoTime = (stage.latestInfo.completionTime.get - stage.latestInfo.submissionTime.get) * 1000000L
+    
+    val accumBlockTime = accum.find(x => x._2.name == Some(InternalAccumulator.BLOCK_TIME))
+    accumBlockTime match{
+      case Some(x) =>
+        if (x._2.value != None) {
+          val getBlockTime = x._2.value.get.asInstanceOf[java.util.List[(Int, Long)]]
+          logInfoSSP(s"reduced BlockTime from stage ${stage.id} $getBlockTime", isSSparkLogEnabled)
+          rddTime = blockTimeToRddTime(getBlockTime, stageNanoTime, stage.id)
+          logInfoSSP(s"RddTime ${rddTime}", isSSparkLogEnabled)
+        }
+        else
+          logErrorSSP("Couldn't find accumBlockTime value")  
+      case _ => logInfoSSP("None accumBlockTime $accumBlockTime", isSSparkLogEnabled)  
+    }
+
+    val accumBlockSize = accum.find(x => x._2.name == Some(InternalAccumulator.BLOCK_SIZE))
+    accumBlockSize match{
+      case Some(x) =>
+        if (x._2.value != None) {
+          val getBlockSize = x._2.value.get.asInstanceOf[java.util.List[(Int, Long)]]
+          logInfoSSP(s"reduced BlockSize from stage ${stage.id} $getBlockSize", isSSparkLogEnabled)
+          rddSize = blockSizeToRddSize(getBlockSize, stage.id)
+          logInfoSSP(s"RddSize ${rddSize}", isSSparkLogEnabled)
+        }
+        else
+          logErrorSSP("Couldn't find accumBlockSize value")
+      case _ => logInfoSSP("None accumBlockSize $accumBlockSize", isSSparkLogEnabled)  
+    }
+
+    /*
+    // is it possible None? ALS Error
+    val accumBlockTime = accum.find(x => x._2.name == Some(InternalAccumulator.BLOCK_TIME)).get._2
+    if (accumBlockTime.value != None) {
+      val getBlockTime = accumBlockTime.value.get.asInstanceOf[java.util.List[(Int, Long)]]
+      logInfoSSP(s"reduced BlockTime from stage ${stage.id} $getBlockTime")
+      rddTime = blockTimeToRddTime(getBlockTime, stageNanoTime)
+      logInfoSSP(s"RddTime ${rddTime}")
+    }
+    else
+      logErrorSSP("Couldn't find accumBlockTime value")  
+    
+    val accumBlockSize = accum.find(x => x._2.name == Some(InternalAccumulator.BLOCK_SIZE)).get._2
+    if (accumBlockSize.value != None) {
+      val getBlockSize = accumBlockSize.value.get.asInstanceOf[java.util.List[(Int, Long)]]
+      logInfoSSP(s"reduced BlockSize from stage ${stage.id} $getBlockSize")
+      rddSize = blockSizeToRddSize(getBlockSize)
+      logInfoSSP(s"RddSize ${rddSize}")
+    }
+    else
+      logErrorSSP("Couldn't find accumBlockSize value")
+    */
+
+    logInfoSSP(s"Lineage ${stage.id} ${sc.lineages.get(stage.id)}", isSSparkLogEnabled) //
+    //logInfoSSP(s"Lineages ${sc.lineages}")
+    if (rddTime.size > 0 || rddSize.size > 0)
+      makeSaveForm(stage, rddTime, rddSize)
+    else
+      logErrorSSP(s"Nothing in rddTime:${rddTime} or rddSize:${rddSize}")
+    
+  }
+
+  // SSPARK: make "time per input size" & "output size per input size"
+  private def makeSaveForm(stage: Stage, rddTime: HashMap[Int, Long], rddSize: HashMap[Int, Long]): Unit = {
+    /* 
+      1. need file size (read size) for RDD 1
+          calc input size
+      2. merge same rdd name & callSite into one operation
+      3. filter unnecessary operations, e.g., shuffle 
+          may start from lineage.head and when meet recoginized operation (sc)
+    */
+    
+    val lineage = sc.lineages.get(stage.id).get
+    val accum = stage.latestInfo.accumulables
+    val opTimePerIn = HashSet[(String, Long, Long)]()
+    val opOutPerIn = HashSet[(String, Long, Long)]()
+
+    val accumInputBytes = accum.find(x => x._2.name == Some(InternalAccumulator.input.BYTES_READ)) match {
+      case Some(x) => x._2.value.get.asInstanceOf[Long]
+      case _ => 0L
+    }
+    val accumShuffleRemote = accum.find(x => x._2.name == Some(InternalAccumulator.shuffleRead.REMOTE_BYTES_READ)) match {
+      case Some(x) => x._2.value.get.asInstanceOf[Long]
+      case _ => 0L
+    }
+    val accumShuffleLocal = accum.find(x => x._2.name == Some(InternalAccumulator.shuffleRead.LOCAL_BYTES_READ)) match {
+      case Some(x) => x._2.value.get.asInstanceOf[Long]
+      case _ => 0L
+    }
+    /*
+    val accumShuffleWrite = accum.find(x => x._2.name == Some(InternalAccumulator.shuffleWrite.BYTES_WRITTEN)) match {
+      case Some(x) => x._2.value.get.asInstanceOf[Long]
+      case _ => 0L
+    }*/
+
+    val accumShuffleBytes: Long = accumShuffleRemote + accumShuffleLocal
+    //is it possible that lineage has multiple rdd operations which are same callSite&name without dependency?
+    //probably not... then don't need to check dependency, just check name & callSite
+    
+    def rddProfileToOpProfile(nameWithCallSite: String, in: Any, out: Any, time: Any): Unit = {
+      val name = nameWithCallSite.split('(')(0)
+      //if (sc.isShuffleOp(name)) {
+        // do nothing, 
+        // just comment out this condition, if all operation profiling needs
+      //  None
+      //}
+      //else {
+        if (out != None && in != None && time != None){
+          if (opTimePerIn.find(x => x._1 == nameWithCallSite) != None
+            && opOutPerIn.find(x => x._1 == nameWithCallSite) != None) {
+            // exist already
+            val prevElemTPI = opTimePerIn.find(x => x._1 == nameWithCallSite).get
+            val prevElemOPI = opOutPerIn.find(x => x._1 == nameWithCallSite).get
+
+            var updatedIn = prevElemOPI._2
+            var updatedTime = prevElemTPI._3
+            var updatedOut = prevElemOPI._3
+
+            updatedIn = in.asInstanceOf[Long]       // change child input to parent input
+            //updatedOut don't need to change, becasue it should be youngest node
+            updatedTime += time.asInstanceOf[Long]  // RDD times should be added into one operation time
+
+            opTimePerIn -= prevElemTPI
+            opOutPerIn -= prevElemOPI
+            opTimePerIn.add( (nameWithCallSite, updatedIn, updatedTime) )
+            opOutPerIn.add( (nameWithCallSite, updatedIn, updatedOut) )
+
+          }
+          else if (opTimePerIn.find(x => x._1 == nameWithCallSite) != None
+            || opOutPerIn.find(x => x._1 == nameWithCallSite) != None)
+            logErrorSSP("Error case")
+          else {
+            opTimePerIn.add( (nameWithCallSite, in.asInstanceOf[Long], time.asInstanceOf[Long]) )
+            opOutPerIn.add( (nameWithCallSite, in.asInstanceOf[Long], out.asInstanceOf[Long]) )
+          }
+        }
+      //}
+    }
+    
+    /*
+    def multipleParents(x: SparkContext#LineageInfo): Boolean = {
+      x.parent.size match {
+        case 1 => false
+        case 0 =>
+          //println("No parents")
+          false
+        case _ => true
+      }
+    }*/
+
+    val visited = HashSet[Int]()
+
+    def lineageIterator(x: (Int, SparkContext#LineageInfo)): Unit = {
+      val name = s"${x._2.name}(${x._2.callSite})"
+      val out = rddSize.get(x._1).getOrElse(None)
+      val time = rddTime.get(x._1).getOrElse(None)
+     
+      //if (!multipleParents(x._2)) {
+      if (x._2.deps.size == 1) {
+        val pId = x._2.deps.last
+        
+        // -1 is from stage, -2 is from job, 0 is from read file
+        if (pId == -1 || pId == -2 || pId == 0) { // in this case, input size should be shuffle or inputBytes
+          val in = if (accumInputBytes != 0L) accumInputBytes
+          else if (accumShuffleBytes != 0L) accumShuffleBytes
+          else {
+            logErrorSSP(s"both of InputBytes and ShuffleBytes are zero, rdd id ${x._1} on stage ${stage.id}")
+            None
+          }
+          logInfoSSP(s"visited ${x._1} name:$name input:$in output:$out time:$time", isSSparkLogEnabled)
+          visited.add(x._1)
+          rddProfileToOpProfile(name, in, out, time)
+        }
+        
+        else {
+          val in = rddSize.get(pId).getOrElse(None)
+          logInfoSSP(s"visited ${x._1} name:$name input:$in output:$out time:$time", isSSparkLogEnabled)
+          visited.add(x._1)
+          rddProfileToOpProfile(name, in, out, time)
+          val parent = lineage.find(k => k._1 == pId)
+          if (parent != None) {
+            if(!visited.contains(pId))
+              lineageIterator(parent.get)
+          }
+          else 
+            logInfoSSP(s"got parent None id $pId", isSSparkLogEnabled)
+        }
+      }
+
+      else if (x._2.deps.size == 0) {  // ParallelCollectionRDD case
+          val in = 0L
+          logInfoSSP(s"visited ${x._1} name:$name input:$in output:$out time:$time", isSSparkLogEnabled)
+          visited.add(x._1)
+          rddProfileToOpProfile(name, in, out, time)
+      }
+
+      else {  // multipleParents
+        val pIds = x._2.deps
+        var in = {    // sum of parents RDD size, make sure to make it sense
+          var sum = 0L
+          pIds.map{x => 
+            val size = rddSize.get(x).getOrElse(0L)
+            sum += size
+          }
+          sum
+        } // if there is shuffle dependency to previous stage, then one of size will be 0
+        
+        if (pIds.contains(-1)) {  // therefore, just add shuffle read bytes into in
+          in += accumShuffleBytes
+        }
+
+        var tmpStr = "parents size: "
+        pIds.map{x => 
+          val size = rddSize.get(x).getOrElse(0L)
+          tmpStr += s"[$x] $size "
+        }
+
+        logInfoSSP(s"$tmpStr, shuffleBytes: $accumShuffleBytes, in: $in", isSSparkLogEnabled)
+
+        logInfoSSP(s"visited ${x._1} name:$name input:$in output:$out time:$time", isSSparkLogEnabled)
+        visited.add(x._1)
+        rddProfileToOpProfile(name, in, out, time)
+        pIds.map(xi => lineage.find(k => k._1 == xi)) 
+            .map { parent => 
+              if (parent != None) {
+                if (!visited.contains(parent.get._1))
+                  lineageIterator(parent.get)
+              }
+              else
+                logInfoSSP(s"got parent None", isSSparkLogEnabled)
+            }
+              
+      }
+    }
+
+    /*
+    lineage.foreach{ x =>
+      val name = x._2.name
+      var out: Long = -1L
+      var in: Long = -1L
+      var time: Long = -1L
+      val multipleParents: Boolean = x._2.parent.size match {
+        case 1 => false
+        case 0 => 
+          logErrorSSP("No parents")
+          false
+        case _ => true
+      }
+
+      if (rddSize.contains(x._1) && rddTime.contains(x._1)) {
+        out = rddSize.get(x._1).get
+        time = rddTime.get(x._1).get
+        in = if (multipleParents) {
+          var sum = 0L
+          val pIds = x._2.parent
+          pIds.map(x => sum += x)
+          sum
+        }
+        else {
+          val pId = x._2.parent.last
+          rddTime.get(pId).get
+        }
+      }
+
+      logInfoSSP(s"name $name, in $in, out $out, time $time")     
+      
+    }*/
+
+    lineageIterator(lineage.head)
+    logInfoSSP(s"stage ${stage.id} Input: ${accumInputBytes} Shuffle-Read: ${accumShuffleBytes}", isSSparkLogEnabled)
+    logInfoSSP(s"OP output/input stage ${stage.id} = ${opOutPerIn}", isSSparkLogEnabled)
+    logInfoSSP(s"OP time/input stage ${stage.id} = ${opTimePerIn}", isSSparkLogEnabled)
+    
+    def getFileWriter(opNameWithCallSite: String, timeOrSize: String): FileWriter = {
+      val filePath = Paths.get(sc.profilingDir
+        + "/" +opNameWithCallSite.split('(')(0)
+        + s"_$timeOrSize.csv")
+      if (Files.exists(filePath))
+        new FileWriter(filePath.toString, true)
+      else
+        new FileWriter(new File(filePath.toString))
+    }
+
+    opOutPerIn.foreach{x =>
+      val fw = getFileWriter(x._1, "size")
+      val inMB = x._2.toFloat / Math.pow(2,20)
+      val outMB = x._3.toFloat / Math.pow(2,20)
+      fw.write(s"${x._1}, ${inMB}, ${outMB}\n") 
+      fw.close()
+    }
+    sc.opOutPerInAccum ++= opOutPerIn
+    opTimePerIn.foreach{x =>
+      val fw = getFileWriter(x._1, "time")
+      val inMB = x._2.toFloat / Math.pow(2,20)
+      val timeS = x._3.toFloat / 1e9
+      fw.write(s"${x._1}, ${inMB}, ${timeS}\n") 
+      fw.close()
+    }
+    sc.opTimePerInAccum ++= opTimePerIn
+
+  }
+
   /**
    * Marks a stage as finished and removes it from the list of running stages.
    */
@@ -1876,6 +2277,14 @@ private[spark] class DAGScheduler(
     if (errorMessage.isEmpty) {
       logInfo("%s (%s) finished in %s s".format(stage, stage.name, serviceTime))
       stage.latestInfo.completionTime = Some(clock.getTimeMillis())
+      
+      if (isSSparkProfileEnabled){
+        val lineage = sc.getLineage(stage.id)
+        if (lineage.size != 0)
+          handleProfiled(stage)
+        else
+          logInfoSSP("is this real submitted stage?", isSSparkLogEnabled)
+      }
 
       // Clear failure count for this stage, now that it's succeeded.
       // We only limit consecutive failures of stage attempts,so that if a stage is

@@ -1,3 +1,7 @@
+.metals/
+.vscode/
+profiling/
+rdg/
 *#*#
 *.#*
 *.iml

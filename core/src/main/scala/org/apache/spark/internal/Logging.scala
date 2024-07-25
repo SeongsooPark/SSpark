@@ -20,6 +20,7 @@ package org.apache.spark.internal
 import org.apache.log4j.{Level, LogManager, PropertyConfigurator}
 import org.slf4j.{Logger, LoggerFactory}
 import org.slf4j.impl.StaticLoggerBinder
+import org.apache.spark.SparkContext
 
 import org.apache.spark.util.Utils
 
@@ -69,6 +70,30 @@ trait Logging {
   protected def logError(msg: => String) {
     if (log.isErrorEnabled) log.error(msg)
   }
+  
+  /**
+   * SSPARK part: Additional log methods
+   * Now we need to change the Enabled value explicitly
+   * If there are too many logs, performance will deteriorate, 
+   * so set the flag to false in the performance experiment.
+   */ 
+  
+  protected def logInfoSSP(msg: => String) {
+    if (log.isInfoEnabled) log.info("SSPARK: "+msg)
+  }
+
+  protected def logInfoSSP(msg: => String, isSSparkLogEnabled: Boolean) {
+    if (log.isInfoEnabled && isSSparkLogEnabled) log.info("SSPARK: "+msg)
+  }
+
+  protected def logErrorSSP(msg: => String) {
+    if (log.isErrorEnabled) log.error("SSPARK: "+msg)
+  }
+
+  protected def logErrorSSP(msg: => String, isSSparkLogEnabled: Boolean) {
+    if (log.isErrorEnabled && isSSparkLogEnabled) log.error("SSPARK: "+msg)
+  }
+  //SSPARK END
 
   // Log methods that take Throwables (Exceptions/Errors) too
   protected def logInfo(msg: => String, throwable: Throwable) {

@@ -40,8 +40,8 @@ import org.apache.spark.partial.BoundedDouble
 import org.apache.spark.partial.CountEvaluator
 import org.apache.spark.partial.GroupedCountEvaluator
 import org.apache.spark.partial.PartialResult
-import org.apache.spark.storage.{RDDBlockId, StorageLevel}
-import org.apache.spark.util.{BoundedPriorityQueue, Utils}
+import org.apache.spark.storage.{RDDBlockId, StorageLevel, RDDInfo}
+import org.apache.spark.util.{BoundedPriorityQueue, Utils, SizeEstimator}
 import org.apache.spark.util.collection.{OpenHashMap, Utils => collectionUtils}
 import org.apache.spark.util.random.{BernoulliCellSampler, BernoulliSampler, PoissonSampler,
   SamplingUtils}
@@ -158,13 +158,31 @@ abstract class RDD[T: ClassTag](
     this
   }
 
+  private def persist(newLevel: StorageLevel, allowOverride: Boolean): this.type = {
+    val remainingMem = sc.getRemainingStorageMem()
+    logInfoSSP(s"MEM: $remainingMem", isSSparkLogEnabled)
+    if(isSSparkOptimizeEnabled) {
+      if (sc.cacheCandidates.contains(newCreationSite)) {
+        persistImpl(newLevel, true)
+      }
+      else {
+        logInfoSSP(s"rdd ${this.id} was called persist() but remove from cache list via optimizeCache()", isSSparkLogEnabled)
+        this
+      }
+    }
+    else { 
+     persistImpl(newLevel, allowOverride)
+    }
+    //this
+  }
+
   /**
    * Mark this RDD for persisting using the specified level.
    *
    * @param newLevel the target storage level
    * @param allowOverride whether to override any existing level with the new one
    */
-  private def persist(newLevel: StorageLevel, allowOverride: Boolean): this.type = {
+  private def persistImpl(newLevel: StorageLevel, allowOverride: Boolean): this.type = {
     // TODO: Handle changes of StorageLevel
     if (storageLevel != StorageLevel.NONE && newLevel != storageLevel && !allowOverride) {
       throw new UnsupportedOperationException(
@@ -299,11 +317,80 @@ abstract class RDD[T: ClassTag](
   }
 
   /**
+   * SSPARK: The method to make a short form of lineage for printing
+   */
+  def shortformLineage(lineage: mutable.LinkedHashMap[Int,String]): String ={
+    var shortform = ""
+    lineage.foreach(x => shortform += x._1 + "  ")
+    shortform
+  }
+
+  
+
+  var isCachedBlock = false  /** SSPARK: variable for checking really cached block of RDD, 
+              it's not possible to check whether it's cached or not with original Spark's variable/value  */
+  val rootLineage = sc.rootLineage
+     
+  private val isSSparkOptimizeEnabled = conf.getBoolean("spark.ssparkOptimize.enabled", false)
+  private val isSSparkProfileEnabled = conf.getBoolean("spark.ssparkProfile.enabled", false)
+  private val isSSparkLogEnabled = conf.getBoolean("spark.ssparkLog.enabled", false)
+
+  def optimizeCache() = {
+    if (sc.cacheCandidates.contains(newCreationSite) && this.id != 0){ // maybe need to change id 0 to rddname HadoopRDD
+      logInfoSSP(s"optimize caching ${this.id} at ${newCreationSite}", isSSparkLogEnabled)
+      this.persist()
+    }
+  }
+
+  /**
    * Internal method to this RDD; will read from cache if applicable, or otherwise compute it.
    * This should ''not'' be called by users directly, but is available for implementors of custom
    * subclasses of RDD.
+   * 
+   * SSPARK: This method has been modified, update block infos to taskmetrics
    */
   final def iterator(split: Partition, context: TaskContext): Iterator[T] = {
+    if(isSSparkProfileEnabled) {
+      val firstRDD = rootLineage.last
+      val getMetrics = context.taskMetrics() 
+      synchronized {
+        val blockScheduledTime = System.nanoTime // SSPARK: this is not an actual start time of block computation because of lazy execution model
+      
+        logInfoSSP(s"Start Task ${context.taskAttemptId} rdd ${this.id} root ${firstRDD}, $blockScheduledTime", isSSparkLogEnabled)
+        val startInfo = new getMetrics.BlockInfos(blockScheduledTime, true,  this.id, split.index, isCachedBlock, firstRDD)
+        getMetrics.setBlockTime(startInfo)
+      }
+
+      val (iterRet, iterLocal) = iteratorImpl(split, context).duplicate 
+      // SSPARK: call original iterator(), make a duplicated iterator for returning and checking size   
+         
+      synchronized {
+        if (this.id != 0) {   // Data skew occurs when traversing the duplicated iterator of the first data block read from storage
+          val iterArray = iterLocal.toArray
+          val iterSize = SizeEstimator.estimate(iterArray)
+        
+          getMetrics.setBlockSize(this.id, iterSize)
+          // logInfoSSP(s"${this.id}[${split.index}] ${iterSize}")
+        }
+
+        val blockEndTime = System.nanoTime
+        val endInfo = new getMetrics.BlockInfos(blockEndTime, false,  this.id, split.index, isCachedBlock, firstRDD)
+        getMetrics.setBlockTime(endInfo)
+    
+        logInfoSSP(s"End Task ${context.taskAttemptId} rdd ${this.id} root ${firstRDD}, $blockEndTime", isSSparkLogEnabled)
+      }
+      iterRet
+    }
+    else
+    {
+      iteratorImpl(split, context)
+    }
+  }
+
+  /**
+   * SSPARK: Original implementation of "iterator"
+   */
+  final def iteratorImpl(split: Partition, context: TaskContext): Iterator[T] = {
     if (storageLevel != StorageLevel.NONE) {
       getOrCompute(split, context)
     } else {
@@ -360,6 +447,7 @@ abstract class RDD[T: ClassTag](
     }) match {
       case Left(blockResult) =>
         if (readCachedBlock) {
+          isCachedBlock = true  // SSPARK: set the isCachedBlock true
           val existingMetrics = context.taskMetrics().inputMetrics
           existingMetrics.incBytesRead(blockResult.bytes)
           new InterruptibleIterator[T](context, blockResult.data.asInstanceOf[Iterator[T]]) {
@@ -1730,6 +1818,7 @@ abstract class RDD[T: ClassTag](
 
   private var storageLevel: StorageLevel = StorageLevel.NONE
 
+  
   /** User code that created this RDD (e.g. `textFile`, `parallelize`). */
   @transient private[spark] val creationSite = sc.getCallSite()
 
@@ -1749,6 +1838,24 @@ abstract class RDD[T: ClassTag](
   private[spark] def elementClassTag: ClassTag[T] = classTag[T]
 
   private[spark] var checkpointData: Option[RDDCheckpointData[T]] = None
+  
+  /* SSPARK: make a new creation sites because we need to distinguish every single RDD, 
+   * including RDD_x and RDD_y from randomSplit,
+   * RDDs with same operation and callSite (e.g., rddx.map(f1).map(f2)) STE doesn't have column info.
+   * rdd.id may distinguish but cannot when application has a different iteration counts when re-run.
+   */
+  @transient private[spark] val newCreationSite: String = sc.newRddCallSite(scope)
+  
+  //SSPARK cache optimize
+  if (isSSparkOptimizeEnabled) {
+    this.optimizeCache()
+  }
+    
+  /*
+  if (isSSparkProfileEnabled && id == 0) {
+    sc.setNewAppName(this)
+  }
+  */
 
   // Whether to checkpoint all ancestor RDDs that are marked for checkpointing. By default,
   // we stop as soon as we find the first such RDD, an optimization that allows us to write

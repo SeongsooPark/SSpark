@@ -17,12 +17,16 @@
 
 package org.apache.spark
 
+import java.nio.file.{Files, Paths} //SSPARK
 import java.io._
 import java.net.URI
 import java.util.{Arrays, Locale, Properties, ServiceLoader, UUID}
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
+import scala.io.Source //SSPARK
+import scala.util.control.Breaks.{break, breakable} //SSPARK
+import scala.collection.mutable.{LinkedHashMap, HashSet} //SSPARK
 import scala.collection.JavaConverters._
 import scala.collection.Map
 import scala.collection.generic.Growable
@@ -219,6 +223,21 @@ class SparkContext(config: SparkConf) extends Logging {
    | context.                                                                              |
    * ------------------------------------------------------------------------------------- */
 
+  // SSPARK profiling dir
+  val profilingPath = Paths.get(sys.env("SPARK_HOME") + "/profiling")
+  if (!Files.exists(profilingPath)){
+    logInfoSSP("Doesn't exist profilng dir, make dir")
+    Files.createDirectory(profilingPath)
+  }
+  val profilingDir: String = profilingPath.toString
+  
+  val rdgPath = Paths.get(sys.env("SPARK_HOME") + "/rdg")
+  if (!Files.exists(rdgPath)){
+    logInfoSSP("Doesn't exist RDG dir, make dir")
+    Files.createDirectory(rdgPath)
+  }
+  val rdgDir: String = rdgPath.toString
+  
   private[spark] def conf: SparkConf = _conf
 
   /**
@@ -358,6 +377,72 @@ class SparkContext(config: SparkConf) extends Logging {
       s"Supplied level $logLevel did not match one of:" +
         s" ${SparkContext.VALID_LOG_LEVELS.mkString(",")}")
     Utils.setLogLevel(org.apache.log4j.Level.toLevel(upperCased))
+  }
+
+  def makePreCandidates(rdg: HashMap[Int, LineageInfo]): HashMap[Int, LineageInfo] = {
+    rdg.filter(x => x._2.count > 1).filterNot(x => x._1 == 0)
+  }
+  
+  /*
+  @volatile private var readRDGAlready = false
+  private[spark] var readedRDG = HashMap[Int, LineageInfo]()
+  private[spark] var preCandidates = HashMap[Int, LineageInfo]()
+
+  // Really need this as a thread?, we need to run this only 1 time at the start
+  def createPreCandidatesThread(): Thread = {
+    new Thread(new Runnable {
+      override def run(): Unit = {
+        logInfoSSP("PreCandidates Thread start", isSSparkLogEnabled)
+        readedRDG = readRDG(newAppName)
+        readRDGAlready = true
+        preCandidates = makePreCandidates(readedRDG)
+        logInfoSSP(s"readRDG ${readedRDG}", isSSparkLogEnabled)
+        logInfoSSP(s"preCandidates ${preCandidates}", isSSparkLogEnabled)
+        logInfoSSP("PreCandidates Thread stop", isSSparkLogEnabled)
+      }
+    })
+  }*/
+  private[spark] val newAppName = creationSite.shortForm.split(" at ")(1).split('.')(0)
+  private[spark] val readedRDG: HashMap[Int, LineageInfo] = readRDG()
+  private[spark] val preCandidates: HashMap[Int, LineageInfo] = makePreCandidates(readedRDG)
+  private[spark] var cacheCandidates: HashSet[String] = preCandidates
+                                                        .map(x => s"${x._2.name}(${x._2.callSite})")
+                                                        .toSet.to[HashSet]
+  /* Cache candidates example, Candidate should be name & callSite + column index not rddId
+    (Ex 1)
+    HashSet[String]("objectFile(SVMWithSGDExample.scala:72:0)", 
+                    "map(GeneralizedLinearAlgorithm.scala:297:0)", 
+                    "randomSplit(SVMWithSGDExample.scala:75:1)") 
+    (Ex 2)
+    HashSet[String]("map(BinaryClassificationMetrics.scala:226:0)",
+                    "map(SVMWithSGDExample.scala:86:1)", 
+                    "objectFile(SVMWithSGDExample.scala:72:0)", 
+                    "UnionRDD(BinaryClassificationMetrics.scala:90:0)", 
+                    "mapPartitionsWithIndex(BinaryClassificationMetrics.scala:200:0)", 
+                    "map(GeneralizedLinearAlgorithm.scala:297:0)", 
+                    "map(SVMWithSGDExample.scala:86:0)", 
+                    "combineByKey(BinaryClassificationMetrics.scala:151:0)", 
+                    "map(BinaryClassificationMetrics.scala:209:0)", 
+                    "randomSplit(SVMWithSGDExample.scala:75:1)", 
+                    "sortByKey(BinaryClassificationMetrics.scala:155:0)", 
+                    "randomSplit(SVMWithSGDExample.scala:75:0)")
+  */
+
+  def createSelectCandidatesThread(): Thread = {
+    new Thread(new Runnable {
+      override def run(): Unit = {
+        logInfoSSP("selectCandidates Thread start", isSSparkLogEnabled)
+        /*if (!readRDGAlready) {
+          readedRDG = readRDG(newAppName)
+          readRDGAlready = true
+          preCandidates = makePreCandidates(readedRDG)
+          logInfoSSP(s"readRDG ${readedRDG}", isSSparkLogEnabled)
+          logInfoSSP(s"preCandidates ${preCandidates}", isSSparkLogEnabled)
+        }*/ //move to createPreCandidatesThread
+        selectCandidates()
+        logInfoSSP("selectCandidates Thread stop", isSSparkLogEnabled)
+      }
+    })
   }
 
   try {
@@ -1978,6 +2063,10 @@ class SparkContext(config: SparkConf) extends Logging {
     if (_statusStore != null) {
       _statusStore.close()
     }
+    if (isSSparkProfileEnabled){
+      val rdg = makeRDG(lineages)
+      writeRDG(rdg)
+    }
     // Clear this `InheritableThreadLocal`, or it will still be inherited in child threads even this
     // `SparkContext` is stopped.
     localProperties.remove()
@@ -2034,6 +2123,662 @@ class SparkContext(config: SparkConf) extends Logging {
     )
   }
 
+  // SSPARK: We classify rdd transformation operation into three types.
+  val predictableOps = Array("objectFile", "sequenceFile", "textFile", "distinct", "partitionBy", "groupByKey", "join")
+  val constantOps = Array("sortByKey", "zip", "zipPartitions", "zipWithIndex", "sample", "randomSplit")
+  val functionalOps = Array("map", "mapPartitions", "mapPartitionsWithIndex", "mapValues", "flatMap", "filter")
+  // We don't need to distinguish shuffle operations, just assume that unrecognized operations as a shuffle or not-to be optimized
+  //val shuffleOps = Array("treeAggregate", "aggregate", ...)
+
+  val accumScope = HashMap[Int, String]()
+  def newRddCallSite[T](scope: T): String = { // must handle None case
+    val scopeId = scope match {
+      case None => -1
+      case x: Option[RDDOperationScope] => x.get.id.toInt
+    }
+    
+    val tmpStr = getCallSite.shortForm.split(" at ")
+    var callSite = ""
+    if (tmpStr.length == 2) {
+      callSite = tmpStr(0).filterNot(_.isWhitespace) + "(" + tmpStr(1).filterNot(_.isWhitespace)
+    }
+    else
+      logErrorSSP(s"Cannot get correct callSite ${tmpStr}")
+
+    var newCallSite = ""
+    if (accumScope.contains(scopeId)) {
+      val newColumn = {
+        if (callSite.startsWith("randomSplit")) 1
+        else 0
+      }
+      newCallSite = callSite + ":" + newColumn.toString + ")"
+      accumScope.put(scopeId, newCallSite)
+    }
+    else { // not same scopeId
+      val newColumn = {
+        val getSameLine = accumScope.find(x => x._2.startsWith(callSite))
+        if (getSameLine != None) {
+          getSameLine.maxBy(x => x._1)._2.split(":")(2).replace(")", "").toInt + 1
+        }
+        else 0
+      }
+      newCallSite = callSite + ":" + newColumn.toString + ")"
+      accumScope.put(scopeId, newCallSite)
+    }
+    newCallSite
+  }
+  
+  @deprecated
+  def newRddCallSite_old(scopeId: Int): String = {
+    val tmpStr = getCallSite.shortForm.split(" at ")
+    var callSite = ""
+    if (tmpStr.length == 2) {
+      callSite = tmpStr(0).filterNot(_.isWhitespace) + "(" + tmpStr(1).filterNot(_.isWhitespace)
+    }
+    else
+      logErrorSSP(s"Cannot get correct callSite ${tmpStr}")
+
+    var newCallSite = ""
+    if (accumScope.contains(scopeId)) {
+      val newColumn = {
+        if (callSite.startsWith("randomSplit")) 1
+        else 0
+      }
+      newCallSite = callSite + ":" + newColumn.toString + ")"
+      accumScope.put(scopeId, newCallSite)
+    }
+    else { // not same scopeId
+      val newColumn = {
+        val getSameLine = accumScope.find(x => x._2.startsWith(callSite))
+        if (getSameLine != None) {
+          getSameLine.maxBy(x => x._1)._2.split(":")(2).replace(")", "").toInt + 1
+        }
+        else 0
+      }
+      newCallSite = callSite + ":" + newColumn.toString + ")"
+      accumScope.put(scopeId, newCallSite)
+    }
+    newCallSite
+  }
+  
+  def isShuffleOp(op: String): Boolean = {
+    !(predictableOps.contains(op) | constantOps.contains(op) | functionalOps.contains(op))
+  }
+  
+  class LineageInfo(val _name: String,
+                    val _callSite: String) {   
+    val deps = new HashSet[Int]()   /*  change variable and method names from parent to deps
+                                     *  because, RDG needs same variables, but child not parent
+                                     */
+
+    val name = _name
+    val callSite = _callSite
+    var count = 0
+
+    def addDeps(p: Int): Unit = {
+      deps.add(p)
+    }
+    def addDeps(p: HashSet[Int]): Unit = {
+      p.map(x => deps.add(x))
+    }
+    override def toString(): String = {
+      val countStr = if (count != 0) s" Count: ${count}" else ""
+      s"${name}(${callSite}) Dep:${deps}${countStr}"
+    }
+  }
+ 
+  /* SSPARK TODO: Probabaly need to check for first stage input size
+  def HDFSFileSize(path: String) = {
+    val hdfsFilePath = path
+    val conf = new Configuration()
+    
+    // Set HDFS NameNode URI
+    val hdfsUri = "hdfs://your-namenode-uri:8020"
+    conf.set("fs.defaultFS", hdfsUri)
+
+    val fs = FileSystem.get(new URI(hdfsUri), conf)
+    val path = new Path(hdfsFilePath)
+
+    if (!fs.exists(path)) {
+      println(s"File $hdfsFilePath does not exist.")
+      sys.exit(1)
+    }
+
+    val fileSize = fs.getContentSummary(path).getLength
+    println(s"File size: $fileSize bytes")
+    
+    fs.close()
+  }*/
+  
+  val opTimePerInAccum = HashSet[(String, Long, Long)]()
+  val opOutPerInAccum = HashSet[(String, Long, Long)]()
+  def selectCandidates(): Unit = {
+    
+    def regression_powerModel(opName: String, readed: HashSet[(String, Double, Double)]): (Double, Double, Double) = {
+      import breeze.linalg._
+      import breeze.stats.regression._
+      import breeze.numerics._
+      import breeze.stats._
+
+      // if opName is a predictable , functional , constant....
+      
+      val x = DenseVector(readed.toSeq.map(_._2).toArray)
+      val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+      val logX = breeze.numerics.log(x)
+      val logY = breeze.numerics.log(y)
+
+      val X = DenseMatrix.horzcat(logX.asDenseMatrix.t, DenseMatrix.ones[Double](logX.length, 1))
+
+      val leastSquaresResult = leastSquares(X, logY)
+      val coefficients = leastSquaresResult.coefficients
+
+      val a = math.exp(coefficients(1))
+      val b = coefficients(0)
+
+      val yPred = x.map(xi => a * math.pow(xi, b))
+
+      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+      val ssRes = sum((y - yPred) ^:^ 2.0)
+      val rSquared = 1 - (ssRes / ssTotal)
+
+      logInfoSSP(s"Power model for $opName: y = $a * x^$b with R^2 $rSquared", isSSparkLogEnabled)
+      (a, b, rSquared)  // coefficient a and b
+    }
+
+    def regression_linearModel(opName: String, readed: HashSet[(String, Double, Double)]): (Double, Double, Double) = {
+      import breeze.linalg._
+      import breeze.stats.regression._
+      import breeze.numerics._
+      import breeze.stats._
+
+      val x = DenseVector(readed.toSeq.map(_._2).toArray)
+      val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+      val X = DenseMatrix.horzcat(x.asDenseMatrix.t, DenseMatrix.ones[Double](x.length, 1))
+
+      val leastSquaresResult = leastSquares(X, y)
+      val coefficients = leastSquaresResult.coefficients
+
+      val a = coefficients(0)
+      val b = coefficients(1)
+      
+      val yPred = x.map(xi => a * xi + b)
+
+      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+      val ssRes = sum((y - yPred) ^:^ 2.0)
+      val rSquared = 1 - (ssRes / ssTotal)
+
+      logInfoSSP(s"Linear model for $opName: y = $a * x + $b with R^2 $rSquared", isSSparkLogEnabled)
+      (a, b, rSquared)  // coefficient a and b
+    }
+
+    def regression_polynomial2dModel(opName: String, readed: HashSet[(String, Double, Double)]): (Double, Double, Double, Double) = {
+      import breeze.linalg._
+      import breeze.stats.regression._
+      import breeze.numerics._
+      import breeze.stats._
+      
+      val x = DenseVector(readed.toSeq.map(_._2).toArray)
+      val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+      val X = DenseMatrix.horzcat(
+        x.map(xi => xi * xi).asDenseMatrix.t, 
+        x.asDenseMatrix.t,                    
+        DenseMatrix.ones[Double](x.length, 1) 
+      )
+      val leastSquaresResult = leastSquares(X, y)
+      val coefficients = leastSquaresResult.coefficients
+
+      val a2 = coefficients(0)
+      val a1 = coefficients(1)
+      val b = coefficients(2)
+
+      val yPred = x.map(xi => a2 * xi * xi + a1 * xi + b)
+
+      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+      val ssRes = sum((y - yPred) ^:^ 2.0)
+      val rSquared = 1 - (ssRes / ssTotal)
+
+      logInfoSSP(s"Polynomial2d model for $opName: y = $a2 * x^2 + $a1 * x + $b with R^2 $rSquared", isSSparkLogEnabled)
+      (a2, a1, b, rSquared) // coefficient a2, a1, and b
+    }
+    
+    def regression_polynomial3dModel(opName: String, readed: HashSet[(String, Double, Double)]): (Double, Double, Double, Double, Double) = {
+      import breeze.linalg._
+      import breeze.stats.regression._
+      import breeze.numerics._
+      import breeze.stats._
+      
+      val x = DenseVector(readed.toSeq.map(_._2).toArray)
+      val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+      val X = DenseMatrix.horzcat(
+        x.map(xi => xi * xi * xi).asDenseMatrix.t, 
+        x.map(xi => xi * xi).asDenseMatrix.t,      
+        x.asDenseMatrix.t,                         
+        DenseMatrix.ones[Double](x.length, 1)      
+      )
+      val leastSquaresResult = leastSquares(X, y)
+      val coefficients = leastSquaresResult.coefficients
+
+      val a3 = coefficients(0)
+      val a2 = coefficients(1)
+      val a1 = coefficients(2)
+      val b = coefficients(3)
+
+      val yPred = x.map(xi => a3 * xi * xi * xi + a2 * xi * xi + a1 * xi + b)
+
+      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+      val ssRes = sum((y - yPred) ^:^ 2.0)
+      val rSquared = 1 - (ssRes / ssTotal)
+
+      logInfoSSP(s"Polynomial3d model for $opName: y = $a3 * x^3 + $a2 * x^2 + $a1 * x + $b with R^2 $rSquared", isSSparkLogEnabled)
+      (a3, a2, a1, b, rSquared) // coefficient a3, a2, a1, and b
+    }
+
+    def y_powerModel(coeffA: Double, coeffB: Double, x: Double): Double = {
+      //xi => a * math.pow(xi, b)
+      coeffA * math.pow(x, coeffB)
+    }
+    def y_linearModel(coeffA: Double, coeffB: Double, x: Double): Double = {
+      //xi => a * xi + b
+      coeffA * x + coeffB
+    }
+    def y_polynomial2dModel(coeffA2: Double, coeffA1: Double, coeffB: Double, x: Double): Double = {
+      //xi => a2 * xi * xi + a1 * xi + b
+      coeffA2 * x * x + coeffA1 * x + coeffB
+    }
+    def y_polynomial3dModel(coeffA3: Double, coeffA2: Double, coeffA1: Double, coeffB: Double, x: Double): Double = {
+      //xi => a3 * xi * xi * xi + a2 * xi * xi + a1 * xi + b
+      coeffA3 * x * x * x + coeffA2 * x * x + coeffA1 * x + coeffB
+    }
+
+    def readProfiling(candidate: String, sizeOrTime: String): (String, HashSet[(String, Double, Double)]) = { // candidate = opName(newCallSite), sizeOrTime = "size" or "time"
+      val opName = candidate.split('(')(0)
+      val filePath = Paths.get(profilingDir + "/" + opName + "_" + sizeOrTime + ".csv")
+      val readed = HashSet[(String, Double, Double)]()
+      if (Files.exists(filePath)) {
+        val fileReader = Source.fromFile(filePath.toString)
+        for (line <- fileReader.getLines()) {
+          val tmpTokens = line.split(',')
+          val candName = tmpTokens(0)//,filterNot(_.isWhitespace)
+          val firstItem = tmpTokens(1).toDouble   // input size
+          val secondItem = tmpTokens(2).toDouble  // time from _time, output size from _size
+          readed.add( (candName, firstItem, secondItem) ) // duplicated value will be eliminated
+        }
+        fileReader.close()
+      }
+      
+      (opName, readed)
+    }
+        
+    cacheCandidates.map{cand => 
+      val (opName, readedSize) = readProfiling(cand, "size")
+      readedSize ++= opOutPerInAccum.filter(x => x._1.startsWith(opName+"("))
+                                .map{x => 
+                                  (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / Math.pow(2,20))
+                                }
+
+      // Maybe... this need only for the cand, size for every ops on stage
+      val (_, readedTime) = readProfiling(cand, "time")
+      readedTime ++= opTimePerInAccum.filter(x => x._1.startsWith(opName+"("))
+                                .map{x => 
+                                  (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / 1e9)
+                                }
+      
+      //logInfoSSP(s"Application accum time $opTimePerInAccum")
+      //logInfoSSP(s"Application accum size $opOutPerInAccum")
+      try {
+        if (readedSize.size > 1){
+          logInfoSSP(s"Try to makeRegressionModel for $opName with $readedSize", isSSparkLogEnabled)
+          regression_powerModel(opName, readedSize)
+        }
+        else {
+          logInfoSSP(s"Not enough profiled data for $opName", isSSparkLogEnabled)
+          throw new Exception
+        }
+            
+      } catch {
+        case e: Exception => logInfoSSP(s"cannot find a regressionModel")
+      }
+
+
+
+    }
+  }
+
+  
+  // use LinkedHashMap for ordering of lineage
+  val lineages = HashMap[Int, LinkedHashMap[Int, LineageInfo]]()  // K=stageId, V=stageLineage, stageLineage's deps are its parents
+  val rootLineage = HashSet[Int]()  // SSPARK TODO: it doens't need to be HashSet, just a scalar value
+  def getLineage(stageId: Int): LinkedHashMap[Int, LineageInfo] = {
+    lineages.get(stageId) match {
+      case Some(x) => x
+      case None =>
+        logErrorSSP(s"$stageId lineage does not exist")
+        new LinkedHashMap[Int, LineageInfo]
+    }
+  }
+
+  def checkLineage(lineage: LinkedHashMap[Int, LineageInfo]): Int = { 
+    var countAll = 0
+    lineage.foreach{ x =>
+      if (x._2.deps.contains(-1))
+        countAll += 1
+      if (x._2.deps.contains(-2))
+        countAll += 1
+    }
+    countAll
+  }
+
+  def getRootLineage(lineage: LinkedHashMap[Int, LineageInfo]): Int = {
+    val rootCandidates = lineage.filter(x => x._2.deps.contains(-1) || x._2.deps.contains(-2) || x._2.deps.contains(-3))
+    if (rootCandidates.size > 0) {
+      if ( rootCandidates.size == 1 ) {
+        rootCandidates.head._1
+      }
+      else {
+        rootCandidates.minBy(x => x._1)._1
+      }
+    }
+    else {
+      logErrorSSP("cannot find a root")
+      0
+    }
+  }
+
+  @deprecated // this is old version of getRootLineage, need to check new version can handle all cases
+  def getRootLineage_dep(lineage: LinkedHashMap[Int, LineageInfo]): Int = {
+    val rootLineage =
+      if (checkLineage(lineage) == 1)   // Job start (-2) or shuffle start (-1)
+        lineage.find(x => x._2.deps.contains(-1) | x._2.deps.contains(-2)).get._1
+      else {
+        // logErrorSSP(s"it has multiple starting nodes $checkLineage")
+        // ALS encounter this case, I'm not sure that this case only can be made from cached case?
+        // Now, if there are multiple root and there isn't no cached intermediate cached RDD, then it occurs runtime error
+        val rootNodes = lineage.filter(x => x._2.deps.contains(-1) || x._2.deps.contains(-2))
+                              .filter(x => x._2.deps.size == 1)
+        if (rootNodes.size == 1) {
+          rootNodes.head._1
+        }
+        else if (lineage.filter(x => x._2.deps.contains(-3)).size == 1){  //for ParallelCollectionRDD
+          lineage.filter(x => x._2.deps.contains(-3)).head._1
+        }
+        else if (lineage.filter(x => x._2.deps.contains(-1)).size > 1) {  //for multiple ShuffledRDD
+          if (lineage.filter(x => x._2.deps.contains(-1)).filter(x => x._2.deps.size == 1).size > 1) {
+            lineage.filter(x => x._2.deps.contains(-1)).filter(x => x._2.deps.size == 1).minBy(x => x._1)._1
+          }
+          else {
+            lineage.filter(x => x._2.deps.contains(-1)).minBy(x => x._1)._1
+          }
+          //update makeLineage wih over stage dependency for ShuffledRDD
+        }
+        else { // I'm not sure that it is exist like this case, brute forcely set 0
+          // ALS cannot find a root, because it's start with ParallelCollectionRDD
+          logErrorSSP("cannot find a root")
+          0
+        }
+      }
+    rootLineage
+  }
+
+  def addActionLineage(lineage: LinkedHashMap[Int, LineageInfo]): Unit = {  // don't know this is necessary
+    lineage.put(-3, new LineageInfo("", "action"))
+    lineage.get(-3).get.addDeps(lineage.head._1)
+  }
+  
+  def getOpName(rdd: RDD[_]): String = {  // maybe don't need anymore
+    val tmpStr = rdd.toString.split(" at ")
+    if (tmpStr.length == 3) {
+      val opName = tmpStr(1).filterNot(_.isWhitespace)
+      val callSite = tmpStr(2).split('[')(0).filterNot(_.isWhitespace)
+      opName + "(" + callSite + ")"
+    }
+    else {
+      logErrorSSP("cannot get OpName")
+      ""
+    }
+  }
+
+  /**
+   * SSPARK: Make a lineage for each task or job
+   * To adopt an optimization approach, a lineage must be created for each task.
+   */ 
+  private[spark] val isSSparkLogEnabled = conf.getBoolean("spark.ssparkLog.enabled", false)
+  private[spark] var isSSparkOptimizeEnabled = conf.getBoolean("spark.ssparkOptimize.enabled", false)
+  private[spark] val isSSparkProfileEnabled = conf.getBoolean("spark.ssparkProfile.enabled", false)
+
+  def makeLineage(stageId: Int, rdd: RDD[_]): Unit = {
+    val lineage = new LinkedHashMap[Int, LineageInfo]()
+    def selfInfo(rdd: RDD[_]): Unit ={
+      val len = rdd.dependencies.length
+      len match{
+        case 0 => 
+          val id = addNode(rdd)
+          if (rdd.toString.startsWith("ParallelCollectionRDD")) lineage.get(id).get.addDeps(-3) 
+          else lineage.get(id).get.addDeps(-2)  // from Job
+        case 1 =>
+          val parentDep = rdd.dependencies.head
+          if (parentDep.isInstanceOf[ShuffleDependency[_, _, _]]) {
+            //logInfoSSP(s"$rdd has parent: -1(Stage)")
+            val id = addNode(rdd)
+            //lineage.get(id).get.addDeps(-1)  // from Stage
+            lineage.get(id).get.addDeps(HashSet(-1, parentID(parentDep))) 
+          }
+          else {
+            //logInfoSSP(s"$rdd has parent: ${parentDep.rdd}")
+            val id = addNode(rdd)
+            lineage.get(id).get.addDeps(parentID(parentDep))
+            selfInfo(parentDep.rdd)
+          }
+        case _ =>
+          //logInfoSSP(s"$rdd has $len parents: ")
+          val id = addNode(rdd)
+          rdd.dependencies.foreach{parentDep => 
+            if (parentDep.isInstanceOf[ShuffleDependency[_, _, _]]) {
+              //logInfoSSP(s"${parentDep.rdd}\t\t -1(Stage)")
+              //lineage.get(id).get.addDeps(-1)
+              lineage.get(id).get.addDeps(HashSet(-1, parentID(parentDep))) 
+            }
+            else {
+              //logInfoSSP(s"\t\t ${parentDep.rdd}")
+              lineage.get(id).get.addDeps(parentID(parentDep))
+              selfInfo(parentDep.rdd)
+            }
+          }
+      }
+    }
+
+    @deprecated //Dep should be recognized in the previous step, so this method may handle only 1 dep
+    def parentsIDs(parentDep: Seq[Dependency[_]]): HashSet[Int] = {
+      var ids = new HashSet[Int]()
+      parentDep.map{x => 
+        val tmpStr = x.rdd.toString.split(" at ")
+        val id = tmpStr(0).split('[')(1).split(']')(0).toInt
+        ids.add(id)
+      }
+      ids
+    }
+
+    def parentID(parentDep: Dependency[_]): Int = { 
+      val tmpStr = parentDep.rdd.toString.split(" at ")
+      val id = tmpStr(0).split('[')(1).split(']')(0).toInt
+      id
+    }
+
+    def addNode(rdd: RDD[_]): Int = {
+      val id = rdd.id
+      val tmpStr = rdd.newCreationSite.split('(')
+      if (tmpStr.length == 2){
+        val opName = tmpStr(0)
+        val callSite = tmpStr(1).replace(")","")
+        if (!lineage.contains(id)) {
+          lineage.put(id, new LineageInfo(opName, callSite))
+          //rdd.optimizeCache()  // for making a new decision whether cache it or not, really need this?
+        }
+      }
+      else logErrorSSP(s"Lineage addNode unknwon case ${rdd}")
+      id      
+    }
+
+    @deprecated   // previous version, without colummn
+    def addNode_old(rdd: RDD[_]): Int = {
+      var id = -1
+      val tmpStr = rdd.toString.split(" at ")
+      if (tmpStr.length == 3) {
+        id = tmpStr(0).split('[')(1).split(']')(0).toInt
+        val opName = tmpStr(1).filterNot(_.isWhitespace)
+        val callSite = tmpStr(2).split('[')(0).filterNot(_.isWhitespace)
+        if (lineage.contains(id)) None
+        else lineage.put(id, new LineageInfo(opName, callSite))
+      }
+      else logErrorSSP(s"Lineage addNode unknwon case ${rdd}")
+      id
+    }
+
+    //lineage.clear()
+    
+    rootLineage.clear()
+    selfInfo(rdd)
+    lineages.put(stageId, lineage)
+    rootLineage.add(getRootLineage(lineage))
+    logInfoSSP(s"Lineage was made with root ${rootLineage} $lineage \n ${rdd.toDebugString}", isSSparkLogEnabled)
+  }
+  
+  /*
+  private[spark] var newAppName: String = _
+
+  def setNewAppName(rdd: RDD[_]): Unit = {
+    val tmpStr = rdd.toString.split(" at ")
+    if (tmpStr.length == 3) {
+      newAppName = tmpStr(2).split('.')(0).filterNot(_.isWhitespace)
+    }
+    else {
+      logErrorSSP("SSparkOptimize set disabled because it's not able to recognize appname")
+      isSSparkOptimizeEnabled = false
+    }
+  }*/
+
+  def getFileNameFromRootRDD(rdg: HashMap[Int, LineageInfo]): String = {
+    rdg.get(rdg.minBy(_._1)._1).get.callSite.split('(')(0).split('.')(0) + ".rdg"
+  }
+
+  def makeRDG(lineages: HashMap[Int, LinkedHashMap[Int, LineageInfo]]): HashMap[Int, LineageInfo] = {
+    val rdg = HashMap[Int, LineageInfo]()
+
+    def findChildren(rdd: Int): HashSet[Int] = {
+      val children = HashSet[Int]()
+      lineages.foreach { stageLineage =>
+        val nodeInfo = stageLineage._2.filter(x => x._2.deps.contains(rdd))
+        nodeInfo.foreach(x => children.add(x._1))
+      }
+      children
+    }
+
+    def addNode(rdd: Int): Unit = {
+      val node = lineages.find(_._2.contains(rdd)).get._2.find(_._1 == rdd).get
+      rdg.put(rdd, new LineageInfo(node._2.name, node._2.callSite))
+      rdg.get(rdd).get.addDeps(findChildren(rdd))
+    }
+
+    def selfInfo(rdd: Int): Unit = {
+      if (!rdg.contains(rdd)) {
+        addNode(rdd)
+        findChildren(rdd).map(x => selfInfo(x))
+      }
+    }
+
+    def findParent(rdd: Int): HashSet[Int] = {
+      val parent = HashSet[Int]()
+      rdg.filter(x => x._2.deps.contains(rdd)).map(x => parent.add(x._1))
+      parent
+    }
+
+    def countActions(rdd: Int): Unit = {
+      rdg.get(rdd).get.count = rdg.get(rdd).get.count+1
+      findParent(rdd).map(countActions(_))
+    }
+
+    val root = lineages.minBy(x => x._1)._2.minBy(x => x._1)._1 // normally it should be 0
+    selfInfo(root)
+    val leafNodes = HashSet[Int]()
+    rdg.filter(_._2.deps.size == 0).foreach(x => leafNodes.add(x._1))
+
+    leafNodes.map(countActions(_))
+    rdg
+  }
+
+  def writeRDG(rdg: HashMap[Int, LineageInfo]): Unit = {
+    val filePath = Paths.get(rdgDir) + "/" + newAppName + ".rdg"//getFileNameFromRootRDD(rdg)
+    val fw = new FileWriter(filePath)
+
+    rdg.foreach(x => fw.write(s"${x._1}; ${x._2.name}; ${x._2.callSite}; ${x._2.deps}; ${x._2.count}\n"))
+
+    fw.close()
+  }
+
+  def readRDG(): HashMap[Int, LineageInfo] = {
+    val rdg = HashMap[Int, LineageInfo]()
+    val filePath = Paths.get(rdgDir) + "/" + newAppName + ".rdg"
+    if (existsRDG(newAppName)) {
+      val fileReader = Source.fromFile(filePath)
+      def toDepsSet(deps: String): HashSet[Int] = {
+        val depsStr = deps.replace("Set(","")
+                          .replace(")","")
+                          .replace(" ","")
+        val depsSet = HashSet[Int]()
+        depsStr.split(',').map(x => depsSet.add(x.toInt))
+        depsSet
+      }
+      for (line <- fileReader.getLines()) {
+        val tmpLine = line.split(';')
+        val rddId: Int = tmpLine(0).filterNot(_.isWhitespace).toInt
+        val opName: String = tmpLine(1).filterNot(_.isWhitespace)
+        val callSite: String = tmpLine(2).filterNot(_.isWhitespace)
+        val deps: HashSet[Int] = {
+          val depsTmp = tmpLine(3).filterNot(_.isWhitespace)
+          if (depsTmp == "Set()")
+            HashSet[Int]()
+          else
+            toDepsSet(depsTmp)
+        }
+        val count: Int = tmpLine(4).filterNot(_.isWhitespace).toInt
+        rdg.put(rddId, {val info = new LineageInfo(opName, callSite)
+          info.addDeps(deps)
+          info.count = count
+          info})
+      }
+      fileReader.close()
+    }
+    else {
+      logErrorSSP("Cannot read RDG, SSparkOptimize set disabled")
+      isSSparkOptimizeEnabled = false
+    }
+    rdg
+  }
+  
+  def existsRDG(appName: String): Boolean = {   //appName -> without .scala:#line.... e.g., "SVMWithSGDExample"
+    //val filePath = Paths.get(rdgDir + "/" + appName.split('.')(0) + ".rdg")
+    val filePath = Paths.get(rdgDir + "/" + appName + ".rdg")
+    if (Files.exists(filePath)) true
+    else false
+  }
+
+  def getRemainingStorageMem(): Long = {
+    val storageStatus = SparkEnv.get.blockManager.master.getStorageStatus
+    if (isSSparkLogEnabled) {
+      storageStatus.foreach { status =>
+         logInfoSSP(s"persist: Executor ID: ${status.blockManagerId.executorId}, " +
+         s"Max Memory: ${status.maxMem}, Remaining Memory: ${status.memRemaining}")
+      }
+    }
+    storageStatus.filter(_.blockManagerId.executorId != "driver").map(_.memRemaining).sum
+    // SVM stage 0, MEM: 0 .....
+  }
+
+  //def getCost
+
   /**
    * Run a function on a given set of partitions in an RDD and pass the results to the given
    * handler function. This is the main entry point for all actions in Spark.
@@ -2054,6 +2799,7 @@ class SparkContext(config: SparkConf) extends Logging {
     }
     val callSite = getCallSite
     val cleanedFunc = clean(func)
+    accumScope.clear()  // SSPARK
     logInfo("Starting job: " + callSite.shortForm)
     if (conf.getBoolean("spark.logLineage", false)) {
       logInfo("RDD's recursive dependencies:\n" + rdd.toDebugString)
@@ -2440,6 +3186,7 @@ class SparkContext(config: SparkConf) extends Logging {
  * various Spark features.
  */
 object SparkContext extends Logging {
+
   private val VALID_LOG_LEVELS =
     Set("ALL", "DEBUG", "ERROR", "FATAL", "INFO", "OFF", "TRACE", "WARN")
 

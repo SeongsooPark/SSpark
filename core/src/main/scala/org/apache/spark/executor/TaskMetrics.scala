@@ -18,7 +18,7 @@
 package org.apache.spark.executor
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.{ArrayBuffer, LinkedHashMap}
+import scala.collection.mutable.{ArrayBuffer, LinkedHashMap, LinkedHashSet, HashMap}
 
 import org.apache.spark._
 import org.apache.spark.annotation.DeveloperApi
@@ -42,7 +42,7 @@ import org.apache.spark.util._
  * be sent to the driver.
  */
 @DeveloperApi
-class TaskMetrics private[spark] () extends Serializable {
+class TaskMetrics private[spark] () extends Serializable with Logging {
   // Each metric is internally represented as an accumulator
   private val _executorDeserializeTime = new LongAccumulator
   private val _executorDeserializeCpuTime = new LongAccumulator
@@ -55,6 +55,105 @@ class TaskMetrics private[spark] () extends Serializable {
   private val _diskBytesSpilled = new LongAccumulator
   private val _peakExecutionMemory = new LongAccumulator
   private val _updatedBlockStatuses = new CollectionAccumulator[(BlockId, BlockStatus)]
+  
+  // SSPARK part
+  private val _updatedBlockTime = new CollectionAccumulator[(Int, Long)]
+  private val _updatedBlockSize = new CollectionAccumulator[(Int, Long)]
+  
+  private[spark] def toJavaList(v: LinkedHashMap[Int, Long]): java.util.List[(Int, Long)] = {
+    v.toList.asJava
+  }
+  
+  def updatedBlockTime: Seq[(Int, Long)] = {
+    _updatedBlockTime.value.asScala
+  }
+  def updatedBlockSize: Seq[(Int, Long)] = {
+    _updatedBlockSize.value.asScala
+  }
+  
+  private[spark] def setUpdatedBlockTime(v: java.util.List[(Int, Long)]): Unit =
+    _updatedBlockTime.setValue(v)
+  private[spark] def setUpdatedBlockSize(v: java.util.List[(Int, Long)]): Unit =
+    _updatedBlockSize.setValue(v)
+ 
+  /* SSPARK: get BlockInfos from RDD iterator
+   *  blockTime use LinkedHashSet for guarantee the sequence of time stamps
+   *  As a result, it can get actual block computing time on Executor.run 
+   */
+  class BlockInfos(val _time: Long, 
+                   val _isStart: Boolean,
+                   val _rddId: Int, 
+                   val _partitionId: Int, 
+                   val _isCached: Boolean,
+                   val _root: Int                   
+                   ) {
+    val time = _time
+    val isStart = _isStart
+    val rddId = _rddId
+    val partitionId = _partitionId
+    val isCached = _isCached
+    val root = _root
+
+    override def toString(): String = {
+      s"rdd[p]:${rddId}[${partitionId}] root:${root} isStart:${isStart} isCached:${isCached} time:${time}"
+    }
+  }
+
+  private val _blockTime = new LinkedHashSet[BlockInfos]
+  private val _blockSize = new LinkedHashMap[Int, Long] // it should keep the ordering to devide into input/output size
+  
+  def blockTime: LinkedHashSet[BlockInfos] = _blockTime
+  def blockSize: LinkedHashMap[Int, Long]  = _blockSize
+
+  
+
+  private [spark] def setBlockTime(_time: Long, 
+                   _isStart: Boolean,
+                   _rddId: Int, 
+                   _partitionId: Int, 
+                   _isCached: Boolean,
+                   _root: Int
+                   ): Unit =
+    _blockTime.add(new BlockInfos(_time, _isStart, _rddId, _partitionId, _isCached, _root))
+  
+  private [spark] def setBlockTime(infos: BlockInfos): Unit = 
+    _blockTime.add(infos)
+
+  private [spark] def setBlockSize(_rddId: Int, _size: Long): Unit =
+    _blockSize.put(_rddId, _size)
+   
+  def calcBlockTime(isSSparkLogEnabled: Boolean, taskId: Long): LinkedHashMap[Int, Long] ={
+    val calc = new LinkedHashMap[Int, Long]
+    var startTime = 0L
+    var endTime = 0L
+    blockTime.foreach{ x =>
+      if (x.isStart) {
+        startTime = x.time  // doesn't need to distinguish root, just overwrite a startTime for finding last attached node
+        /*
+        if (x.rddId == x.root)  // no cached, run from the root of lineage
+          startTime = x.time
+        else  // scheduled start block but it's not actually executed because of lazy execution
+          None
+          */
+      }
+      else { //isEnd
+        if (x.isCached)
+          startTime = x.time
+        else {
+          endTime = x.time
+          if (endTime == 0L || startTime == 0L)
+            logErrorSSP(s"Time got 0 for rdd ${x.rddId} with root ${x.root}, ST=${startTime}, ET=${endTime}")
+          else {
+            logInfoSSP(s"Task ${taskId} rdd ${x.rddId} from ${startTime} to ${endTime}", isSSparkLogEnabled)
+            calc.put(x.rddId, endTime - startTime)
+          }
+          startTime = x.time
+        }
+      }
+    }
+    calc
+  }
+  // END SSPARK
 
   /**
    * Time taken on the executor to deserialize this task.
@@ -218,6 +317,8 @@ class TaskMetrics private[spark] () extends Serializable {
     DISK_BYTES_SPILLED -> _diskBytesSpilled,
     PEAK_EXECUTION_MEMORY -> _peakExecutionMemory,
     UPDATED_BLOCK_STATUSES -> _updatedBlockStatuses,
+    BLOCK_TIME -> _updatedBlockTime,    //SSPARK
+    BLOCK_SIZE -> _updatedBlockSize,    //SSPARK
     shuffleRead.REMOTE_BLOCKS_FETCHED -> shuffleReadMetrics._remoteBlocksFetched,
     shuffleRead.LOCAL_BLOCKS_FETCHED -> shuffleReadMetrics._localBlocksFetched,
     shuffleRead.REMOTE_BYTES_READ -> shuffleReadMetrics._remoteBytesRead,
@@ -298,7 +399,18 @@ private[spark] object TaskMetrics extends Logging {
       val value = info.update.get
       if (name == UPDATED_BLOCK_STATUSES) {
         tm.setUpdatedBlockStatuses(value.asInstanceOf[java.util.List[(BlockId, BlockStatus)]])
-      } else {
+      } 
+      /*
+      else if (name == BLOCK_TIME){
+        tm.setUpdatedBlockTime(value.asInstanceOf[java.util.List[(Int, Long)]])
+      }
+      else if (name == BLOCK_SIZE){
+        tm.setUpdatedBlockSize(value.asInstanceOf[java.util.List[(Int, Long)]])
+      }*/
+      else if (name == BLOCK_TIME || name == BLOCK_SIZE) {
+        None
+      }
+      else {
         tm.nameToAccums.get(name).foreach(
           _.asInstanceOf[LongAccumulator].setValue(value.asInstanceOf[Long])
         )
