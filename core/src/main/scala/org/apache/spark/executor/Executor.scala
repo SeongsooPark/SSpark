@@ -513,11 +513,11 @@ private[spark] class Executor(
         executorSource.METRIC_DISK_BYTES_SPILLED.inc(task.metrics.diskBytesSpilled)
         executorSource.METRIC_MEMORY_BYTES_SPILLED.inc(task.metrics.memoryBytesSpilled)
 
-        // SSPARK: calc block computing time per each task
+        // calc block computing time per each task
         if(isSSparkProfileEnabled){
+          // may need to roll back to the below ver. w/o the debugging infos
+          // val blockTime = task.metrics.calcBlockTime() 
           val blockTime = task.metrics.calcBlockTime(isSSparkLogEnabled, taskId) 
-            // probably need to modify to previous version without infos for debuging
-            // val blockTime = task.metrics.calcBlockTime() 
           val updatedBlockTime = task.metrics.toJavaList(blockTime)
           val blockSize = task.metrics.blockSize
           val updatedBlockSize = task.metrics.toJavaList(blockSize)
