@@ -16,9 +16,9 @@
  */
 
 package org.apache.spark.scheduler
-import java.nio.file.{Files, Paths}             //* 
-import java.io.{File, FileWriter}               // SSPARK
-import scala.collection.mutable.LinkedHashMap   //*
+import java.nio.file.{Files, Paths}
+import java.io.{File, FileWriter}
+import scala.collection.mutable.LinkedHashMap
 
 import java.io.NotSerializableException
 import java.util.Properties
