@@ -1094,14 +1094,15 @@ private[spark] class DAGScheduler(
         val missing = getMissingParentStages(stage).sortBy(_.id)
         logDebug("missing: " + missing)
         if (missing.isEmpty) {
-          var selectCandidates: Option[Thread] = None
-          if (sc.isSSparkOptimizeEnabled) {
-            val thread = sc.createSelectCandidatesThread
-            thread.start
-          }
           if (isSSparkProfileEnabled) 
             sc.makeLineage(stage.id, stage.rdd)  // SSPARK: make lineage on each Stage
           
+          var selectCandidates: Option[Thread] = None
+          if (sc.isSSparkOptimizeEnabled) {
+            val thread = sc.createSelectCandidatesThread(stage.id)
+            thread.start
+          }
+         
           logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
           submitMissingTasks(stage, jobId.get)
           val startJoin = System.currentTimeMillis()

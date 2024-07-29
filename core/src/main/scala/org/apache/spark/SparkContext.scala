@@ -428,7 +428,7 @@ class SparkContext(config: SparkConf) extends Logging {
                     "randomSplit(SVMWithSGDExample.scala:75:0)")
   */
 
-  def createSelectCandidatesThread(): Thread = {
+  def createSelectCandidatesThread(stageId: Int): Thread = {
     new Thread(new Runnable {
       override def run(): Unit = {
         logInfoSSP("selectCandidates Thread start", isSSparkLogEnabled)
@@ -439,7 +439,7 @@ class SparkContext(config: SparkConf) extends Logging {
           logInfoSSP(s"readRDG ${readedRDG}", isSSparkLogEnabled)
           logInfoSSP(s"preCandidates ${preCandidates}", isSSparkLogEnabled)
         }*/ //move to createPreCandidatesThread
-        selectCandidates()
+        selectCandidates(stageId)
         logInfoSSP("selectCandidates Thread stop", isSSparkLogEnabled)
       }
     })
@@ -2250,9 +2250,43 @@ class SparkContext(config: SparkConf) extends Logging {
     fs.close()
   }*/
   
+  class CandidatesInfo(val _opId: String) {
+    val opId = _opId
+    var time: Double = 0
+    var size: Double = 0
+    var counts: Int = 0
+    var isCached: Boolean = false
+
+    def setTime(_time: Double): Unit = {
+      time = _time
+    }
+
+    def setSize(_size: Double): Unit = {
+      size = _size
+    }
+
+    def setCounts(_counts: Int): Unit = {
+      counts = _counts
+    }
+
+    def setCached(_isCached: Boolean): Unit = {
+      isCached = _isCached
+    }
+
+    def isKnown: Boolean = {
+      time match {
+        case 0 => false
+        case _ => true
+      }
+    }
+    override def toString: String = {
+      s"$opId, $time, $size, $counts, $isCached"
+    }
+  }
+
   val opTimePerInAccum = HashSet[(String, Long, Long)]()
   val opOutPerInAccum = HashSet[(String, Long, Long)]()
-  def selectCandidates(): Unit = {
+  def selectCandidates(stageId: Int): Unit = {
     
     def regression_powerModel(opName: String, readed: HashSet[(String, Double, Double)]): (Double, Double, Double) = {
       import breeze.linalg._
@@ -2409,10 +2443,11 @@ class SparkContext(config: SparkConf) extends Logging {
         }
         fileReader.close()
       }
-      
       (opName, readed)
     }
-        
+    
+    val lineage = getLineage(stageId)
+    
     cacheCandidates.map{cand => 
       val (opName, readedSize) = readProfiling(cand, "size")
       readedSize ++= opOutPerInAccum.filter(x => x._1.startsWith(opName+"("))
@@ -2427,11 +2462,9 @@ class SparkContext(config: SparkConf) extends Logging {
                                   (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / 1e9)
                                 }
       
-      //logInfoSSP(s"Application accum time $opTimePerInAccum")
-      //logInfoSSP(s"Application accum size $opOutPerInAccum")
       try {
         if (readedSize.size > 1){
-          logInfoSSP(s"Try to makeRegressionModel for $opName with $readedSize", isSSparkLogEnabled)
+          logInfoSSP(s"Try to makeRegressionModel for $opName", isSSparkLogEnabled) // with $readedSize", isSSparkLogEnabled)
           regression_powerModel(opName, readedSize)
         }
         else {
@@ -2447,7 +2480,6 @@ class SparkContext(config: SparkConf) extends Logging {
 
     }
   }
-
   
   // use LinkedHashMap for ordering of lineage
   val lineages = HashMap[Int, LinkedHashMap[Int, LineageInfo]]()  // K=stageId, V=stageLineage, stageLineage's deps are its parents
