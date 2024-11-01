@@ -86,6 +86,14 @@ trait Logging {
     if (log.isInfoEnabled && isSSparkLogEnabled) log.info("SSPARK: "+msg)
   }
 
+  protected def logWarningSSP(msg: => String) {
+    if (log.isWarnEnabled) log.warn("SSPARK: "+msg)
+  }
+
+  protected def logWarningSSP(msg: => String, isSSparkLogEnabled: Boolean) {
+    if (log.isWarnEnabled && isSSparkLogEnabled) log.warn("SSPARK: "+msg)
+  }
+
   protected def logErrorSSP(msg: => String) {
     if (log.isErrorEnabled) log.error("SSPARK: "+msg)
   }

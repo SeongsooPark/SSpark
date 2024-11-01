@@ -159,10 +159,11 @@ abstract class RDD[T: ClassTag](
   }
 
   private def persist(newLevel: StorageLevel, allowOverride: Boolean): this.type = {
-    val remainingMem = sc.getRemainingStorageMem()
-    logInfoSSP(s"MEM: $remainingMem", isSSparkLogEnabled)
+    //val remainingMem = sc.getRemainingStorageMem()
+    //logInfoSSP(s"MEM: $remainingMem", isSSparkLogEnabled)
     if(isSSparkOptimizeEnabled) {
-      if (sc.cacheCandidates.contains(newCreationSite)) {
+      //if (!sc.cacheCandidates.filter(x => x.opId == newCreationSite).isEmpty) { //need to change cacheCandidates to cacheList
+      if (sc.cacheList.contains(newCreationSite)) { 
         persistImpl(newLevel, true)
       }
       else {
@@ -336,7 +337,9 @@ abstract class RDD[T: ClassTag](
   private val isSSparkLogEnabled = conf.getBoolean("spark.ssparkLog.enabled", false)
 
   def optimizeCache() = {
-    if (sc.cacheCandidates.contains(newCreationSite) && this.id != 0){ // maybe need to change id 0 to rddname HadoopRDD
+    // maybe need to change id 0 to rddname HadoopRDD
+    //if (!sc.cacheCandidates.filter(x => x.opId == newCreationSite).isEmpty && this.id != 0) {
+    if (sc.cacheList.contains(newCreationSite) && this.id != 0) {
       logInfoSSP(s"optimize caching ${this.id} at ${newCreationSite}", isSSparkLogEnabled)
       this.persist()
     }

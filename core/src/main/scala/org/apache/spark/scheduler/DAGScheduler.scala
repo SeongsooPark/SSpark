@@ -253,7 +253,7 @@ private[spark] class DAGScheduler(
 
   private val isSSparkLogEnabled = sc.getConf.getBoolean("spark.ssparkLog.enabled", false)
   private val isSSparkProfileEnabled = sc.getConf.getBoolean("spark.ssparkProfile.enabled", false)
-
+  
   /**
    * Called by the TaskSetManager to report task's starting.
    */
@@ -1084,6 +1084,8 @@ private[spark] class DAGScheduler(
     }
   }
 
+  var selectCandidatesThread: Option[Thread] = None
+
   /** Submits stage, but first recursively submits any missing parents. */
   private def submitStage(stage: Stage) {
     val jobId = activeJobForStage(stage)
@@ -1096,24 +1098,74 @@ private[spark] class DAGScheduler(
         if (missing.isEmpty) {
           if (isSSparkProfileEnabled) 
             sc.makeLineage(stage.id, stage.rdd)  // SSPARK: make lineage on each Stage
-          
-          var selectCandidates: Option[Thread] = None
+                    
           if (sc.isSSparkOptimizeEnabled) {
-            val thread = sc.createSelectCandidatesThread(stage.id)
-            thread.start
+            val lineage = sc.getLineage(stage.id)
+            val rootLineage = sc.rootLineage.last
+            val (stageInputBytes, startType) = sc.getStageInputBytes(lineage, rootLineage)
+            logInfoSSP(s"stage ${stage.id} input size = $stageInputBytes bytes from $startType", isSSparkLogEnabled)
+
+            if (sc.optimizeMode == "ahead") {
+              val startSC = System.currentTimeMillis()
+              sc.selectCandidates(stage.id, stageInputBytes) 
+              sc.checkOptimizeCache(stage.rdd)
+              val endSC = System.currentTimeMillis()
+              val timeSC = endSC - startSC
+              logInfoSSP(s"[Ahead mode] selectCandidates time: ${timeSC} ms", isSSparkLogEnabled)
+            }
+            else if (sc.optimizeMode == "overlap") {
+              val thread = sc.createSelectCandidatesThread(stage.id, stage.rdd, stageInputBytes)
+              thread.start
+              selectCandidatesThread = Some(thread)
+            }
+            else {
+              logErrorSSP(s"""Wrong sspark.optimizeMode: ${sc.optimizeMode} need "overlap" or "ahead"""")
+            }
           }
-         
+          
+          /*
+          //var selectCandidates: Option[Thread] = None
+          if (sc.isSSparkOptimizeEnabled) {
+            val startSC = System.currentTimeMillis() // Non-thread impl
+            val rootLineage = sc.rootLineage.last
+            val lineage = sc.getLineage(stage.id)
+            val stageInputBytes = {
+              if (lineage.get(rootLineage).get.deps.contains(-2)) 
+                sc.inputBytes
+              else if (lineage.get(rootLineage).get.deps.contains(-1))
+                sc.shuffleBytes
+              else if (lineage.get(rootLineage).get.deps.contains(-3)) 
+                0L
+              else {
+                logErrorSSP(s"Cannot find stage input size ${lineage.get(rootLineage)}")
+                0L
+              }
+            }
+            if (isSSparkLogEnabled) {
+              val startType = { 
+                if (lineage.get(rootLineage).get.deps.contains(-2)) 
+                  "HadoopRDD"
+                else if  (lineage.get(rootLineage).get.deps.contains(-1))
+                  "ShuffleRDD"
+                else if (lineage.get(rootLineage).get.deps.contains(-3))
+                  "ParallelCollectionRDD"
+                else
+                  "ERROR"
+              }
+              logInfoSSP(s"stage ${stage.id} input size = $stageInputBytes bytes from $startType")
+            }
+            //val thread = sc.createSelectCandidatesThread(stage.id, stageInputBytes)
+            //thread.start
+            sc.selectCandidates(stage.id, stageInputBytes)  // Non-thread impl
+            sc.checkOptimizeCache(stage.rdd)
+            val endSC = System.currentTimeMillis()    // Non-thread impl
+            val timeSC = endSC - startSC              // Non-thread impl
+            logInfoSSP(s"selectCandidates time: ${timeSC}ms", isSSparkLogEnabled) // Non-thread impl
+          }
+          */
+        
           logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
           submitMissingTasks(stage, jobId.get)
-          val startJoin = System.currentTimeMillis()
-          selectCandidates.foreach(_.join())
-          val endJoin = System.currentTimeMillis()
-          val tTime = endJoin - startJoin
-          logInfoSSP(s"selectCandidates thread time: ${tTime}ms", isSSparkLogEnabled)
-          if (!isSSparkLogEnabled && tTime > 0){
-            logInfoSSP(s"selectCandidates thread time may have overhead: ${tTime}ms")
-          }
-
         } else {
           for (parent <- missing) {
             submitStage(parent)
@@ -2051,11 +2103,12 @@ private[spark] class DAGScheduler(
       case Some(x) => x._2.value.get.asInstanceOf[Long]
       case _ => 0L
     }
-    /*
     val accumShuffleWrite = accum.find(x => x._2.name == Some(InternalAccumulator.shuffleWrite.BYTES_WRITTEN)) match {
       case Some(x) => x._2.value.get.asInstanceOf[Long]
       case _ => 0L
-    }*/
+    }
+    if (accumShuffleWrite != 0L)
+      sc.shuffleBytes = accumShuffleWrite // assign current stage's write size for using next stage input
 
     val accumShuffleBytes: Long = accumShuffleRemote + accumShuffleLocal
     //is it possible that lineage has multiple rdd operations which are same callSite&name without dependency?
@@ -2275,6 +2328,22 @@ private[spark] class DAGScheduler(
       case Some(t) => "%.03f".format((clock.getTimeMillis() - t) / 1000.0)
       case _ => "Unknown"
     }
+
+    if (selectCandidatesThread.isDefined) {
+      val startJoin = System.currentTimeMillis()
+      selectCandidatesThread.foreach(_.join())
+      val endJoin = System.currentTimeMillis()
+      val tTime = endJoin - startJoin
+      logInfoSSP(s"[Overlap mode] selectCandidates thread overhead: ${tTime} ms", isSSparkLogEnabled)
+    
+      if (tTime > 0) {  //if (!isSSparkLogEnabled && tTime > 0){
+        /* ALS application has huge amount of logs, so it adopts WARN log level
+           for checking overhead of selectCandidates in all cases, change it into WARN level
+        */
+        logWarningSSP(s"selectCandidates thread time may have overhead: ${tTime} ms")
+      }
+    }
+
     if (errorMessage.isEmpty) {
       logInfo("%s (%s) finished in %s s".format(stage, stage.name, serviceTime))
       stage.latestInfo.completionTime = Some(clock.getTimeMillis())
