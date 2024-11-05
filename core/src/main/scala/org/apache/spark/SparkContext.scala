@@ -2160,6 +2160,7 @@ class SparkContext(config: SparkConf) extends Logging {
     // Unset YARN mode system env variable, to allow switching between cluster types.
     SparkContext.clearActiveContext()
     logInfo("Successfully stopped SparkContext")
+    profilingTrim(profilingDir)
   }
 
 
@@ -2220,6 +2221,7 @@ class SparkContext(config: SparkConf) extends Logging {
   // cachePlan: "refreshing" or "enhancing" or "pruning"
   private[spark] val unpersistPlan = conf.getBoolean("spark.sspark.unpersistPlan", false)
   // unpersistPlan: "true" is on, "false" is off
+  private[spark] val maxProfiling = conf.getInt("spark.sspark.maxProfiling", 1000)
 
   if (cachePlan == "pruning" || cachePlan == "refreshing") {  // not sure for "refreshing" mode
     cacheList = cacheCandidates.map(_.opId).toSet.to[HashSet]
@@ -2231,7 +2233,9 @@ class SparkContext(config: SparkConf) extends Logging {
     s"\t\t\t\t\t\t OptimizeMode    = $optimizeMode \t (OVERLAP or ahead)\n" +
     s"\t\t\t\t\t\t CachePlan       = $cachePlan \t (REFRESHING or enhancing or pruning)\n" +
     s"\t\t\t\t\t\t UnpersistPlan   = $unpersistPlan \t (true or FALSE)\n" +
-    s"\t\t\t\t\t\t LogEnabled      = $isSSparkLogEnabled \t (true or FALSE)")
+    s"\t\t\t\t\t\t LogEnabled      = $isSSparkLogEnabled \t (true or FALSE)\n" +
+    s"\t\t\t\t\t\t maxProfiling    = $maxProfiling \t (default: 1000)")
+
 
   // SSPARK: We classify rdd transformation operation into three types.
   val predictableOps = Array("objectFile", 
@@ -2703,13 +2707,27 @@ class SparkContext(config: SparkConf) extends Logging {
       val visited = HashSet[CandidatesInfo]()
       def self(node: CandidatesInfo): Unit = {
         visited.add(node)
+        val op = node.opId.split('(')(0)
+        var resultSize: Double = 0
         val (opName, readedSize) = readProfiling(node.opId, "size")
-        readedSize ++= opOutPerInAccum.filter(x => x._1.startsWith(opName+"("))
-                                .map{x => 
-                                  (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / Math.pow(2,20))
-                                }
-        val resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
-        node.resultSize = resultSize
+          readedSize ++= opOutPerInAccum.filter(x => x._1.startsWith(opName+"("))
+                                  .map{x => 
+                                    (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / Math.pow(2,20))
+                                  }
+
+        if (functionalOps.contains(op)) { 
+          val readedWithSameOpId = readedSize.filter(_._1 == node.opId)
+          resultSize = getValueFromRegression(readedWithSameOpId, opName, node.inputSize, "size")
+        }
+        /* Don't need to distinguish constantOps 
+        else if (constantOps.contains(op)){
+          resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
+        } */
+        else {  // predictable
+          resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
+        }
+
+        node.resultSize = resultSize  
         val children = ancestors.filter(x => x.parents.contains(node.opId)).filterNot(x => visited.contains(x))
         logInfoSSP(s"Node visited ${node.opId} -> ${children.map(_.opId)}")
         children.foreach { x =>   
@@ -2732,16 +2750,29 @@ class SparkContext(config: SparkConf) extends Logging {
     // Do not need Top-down, because time can be calculated by inputSize of itself
     def setTimeOfCandidates(ancestors: LinkedHashSet[CandidatesInfo]): Unit = {
       ancestors.foreach{ node =>
+        val op = node.opId.split('(')(0)
+        var resultTime: Double = 0
         val (opName, readedTime) = readProfiling(node.opId, "time")
         readedTime ++= opTimePerInAccum.filter(x => x._1.startsWith(opName+"("))
                                 .map{x => 
                                   (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / 1e9)
                                 }
-        val time = getValueFromRegression(readedTime, opName, node.inputSize, "time")
-        node.time = time
+
+        if (functionalOps.contains(op)) { 
+          //HashSet[(String, Double, Double)
+          val readedWithSameOpId = readedTime.filter(_._1 == node.opId)
+          resultTime = getValueFromRegression(readedWithSameOpId, opName, node.inputSize, "time")
+        }
+        else if (constantOps.contains(op)){
+          resultTime = readedTime.maxBy(_._3)._3
+        } 
+        else {  // predictable
+          resultTime = getValueFromRegression(readedTime, opName, node.inputSize, "time")
+        }
+        node.time = resultTime
       }
     }
-
+    
     def findTopNodes(ancestors: LinkedHashSet[CandidatesInfo]): LinkedHashSet[CandidatesInfo] = {
       ancestors.filter(node => node.parents.isEmpty)
     }
@@ -3247,7 +3278,20 @@ class SparkContext(config: SparkConf) extends Logging {
     storageStatus.filter(_.blockManagerId.executorId != "driver").map(_.memRemaining).sum
   }
 
-  //def getCost
+  def profilingTrim(dirPath: String): Unit = {
+    val dir = new File(dirPath)
+    val profilingFiles = dir.listFiles.filter(file => file.isFile && file.getName.endsWith(".csv"))
+
+    profilingFiles.foreach { file =>
+      val lines = Source.fromFile(file).getLines().toList
+      if (lines.length > maxProfiling) {
+        val trimmedLines = lines.takeRight(maxProfiling)
+        val writer = new PrintWriter(file)
+        trimmedLines.foreach(writer.println)
+        writer.close()
+      }
+    }
+  }
 
   /**
    * Run a function on a given set of partitions in an RDD and pass the results to the given
