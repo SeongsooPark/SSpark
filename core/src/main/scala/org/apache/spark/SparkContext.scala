@@ -2227,15 +2227,15 @@ class SparkContext(config: SparkConf) extends Logging {
     cacheList = cacheCandidates.map(_.opId).toSet.to[HashSet]
   }
 
-  logInfoSSP(s"== S-Saprk: Steady-optimizing Spark configurations == \n" +
+  logInfoSSP(s"== S-Spark: Steady-optimizing Spark configurations == \n" +
     s"\t\t\t\t\t\t ProfileEnabled  = $isSSparkProfileEnabled \t (true or FALSE)\n" +
     s"\t\t\t\t\t\t OptimizeEnabled = $isSSparkOptimizeEnabled \t (true or FALSE)\n" +
     s"\t\t\t\t\t\t OptimizeMode    = $optimizeMode \t (OVERLAP or ahead)\n" +
     s"\t\t\t\t\t\t CachePlan       = $cachePlan \t (REFRESHING or enhancing or pruning)\n" +
     s"\t\t\t\t\t\t UnpersistPlan   = $unpersistPlan \t (true or FALSE)\n" +
     s"\t\t\t\t\t\t LogEnabled      = $isSSparkLogEnabled \t (true or FALSE)\n" +
-    s"\t\t\t\t\t\t maxProfiling    = $maxProfiling \t (default: 1000)")
-
+    s"\t\t\t\t\t\t maxProfiling    = $maxProfiling \t (default: 1000)\n" +
+    s"\t\t\t\t\t\t #candidates     = ${cacheList.size}")
 
   // SSPARK: We classify rdd transformation operation into three types.
   val predictableOps = Array("objectFile", 
@@ -2393,11 +2393,10 @@ class SparkContext(config: SparkConf) extends Logging {
     }
   }
 
-  val opTimePerInAccum = HashSet[(String, Long, Long)]()
-  val opOutPerInAccum = HashSet[(String, Long, Long)]()
+  //var opTimePerInAccum = HashSet[(String, Long, Long)]()
+  //var opOutPerInAccum = HashSet[(String, Long, Long)]()
   private[spark] var candidatesOnStage = (LinkedHashSet[CandidatesInfo](), LinkedHashSet[CandidatesInfo]())
   // candidatesOnStage._1 is a set of persist candidates and ._2 is a set of unpersist candidates.
-
 
   class CandidatesCombination {
       val nodes = new HashSet[String]()
@@ -2409,197 +2408,413 @@ class SparkContext(config: SparkConf) extends Logging {
       }
   }
 
-  def selectCandidates(stageId: Int, stageInput: Long): Unit = {
-    
-    def regression_powerModel(opName: String, 
+  def regression_powerModel(opName: String, 
                               readed: HashSet[(String, Double, Double)])
                              : (Double, Double, Double) = {
-      import breeze.linalg._
-      import breeze.stats.regression._
-      import breeze.numerics._
-      import breeze.stats._
+    import breeze.linalg._
+    import breeze.stats.regression._
+    import breeze.numerics._
+    import breeze.stats._
 
-      // if opName is a predictable , functional , constant....
-      
-      val x = DenseVector(readed.toSeq.map(_._2).toArray)
-      val y = DenseVector(readed.toSeq.map(_._3).toArray)
-
-      val logX = breeze.numerics.log(x)
-      val logY = breeze.numerics.log(y)
-
-      val X = DenseMatrix.horzcat(logX.asDenseMatrix.t, DenseMatrix.ones[Double](logX.length, 1))
-
-      val leastSquaresResult = leastSquares(X, logY)
-      val coefficients = leastSquaresResult.coefficients
-
-      val a = math.exp(coefficients(1))
-      val b = coefficients(0)
-
-      val yPred = x.map(xi => a * math.pow(xi, b))
-
-      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
-      val ssRes = sum((y - yPred) ^:^ 2.0)
-      val rSquared = 1 - (ssRes / ssTotal)
-
-      logInfoSSP(s"Power model for $opName: y = $a * x^$b with R^2 $rSquared", isSSparkLogEnabled)
-      (a, b, rSquared)  // coefficient a and b
-    }
-
-    def regression_linearModel(opName: String, 
-                               readed: HashSet[(String, Double, Double)])
-                              : (Double, Double, Double) = {
-      import breeze.linalg._
-      import breeze.stats.regression._
-      import breeze.numerics._
-      import breeze.stats._
-
-      val x = DenseVector(readed.toSeq.map(_._2).toArray)
-      val y = DenseVector(readed.toSeq.map(_._3).toArray)
-
-      val X = DenseMatrix.horzcat(x.asDenseMatrix.t, DenseMatrix.ones[Double](x.length, 1))
-
-      val leastSquaresResult = leastSquares(X, y)
-      val coefficients = leastSquaresResult.coefficients
-
-      val a = coefficients(0)
-      val b = coefficients(1)
-      
-      val yPred = x.map(xi => a * xi + b)
-
-      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
-      val ssRes = sum((y - yPred) ^:^ 2.0)
-      val rSquared = 1 - (ssRes / ssTotal)
-
-      logInfoSSP(s"Linear model for $opName: " +
-        s"y = $a * x + $b with R^2 $rSquared", isSSparkLogEnabled)
-      (a, b, rSquared)  // coefficient a and b
-    }
-
-    def regression_polynomial2dModel(opName: String, 
-                                     readed: HashSet[(String, Double, Double)])
-                                    : (Double, Double, Double, Double) = {
-      import breeze.linalg._
-      import breeze.stats.regression._
-      import breeze.numerics._
-      import breeze.stats._
-      
-      val x = DenseVector(readed.toSeq.map(_._2).toArray)
-      val y = DenseVector(readed.toSeq.map(_._3).toArray)
-
-      val X = DenseMatrix.horzcat(
-        x.map(xi => xi * xi).asDenseMatrix.t, 
-        x.asDenseMatrix.t,                    
-        DenseMatrix.ones[Double](x.length, 1) 
-      )
-      val leastSquaresResult = leastSquares(X, y)
-      val coefficients = leastSquaresResult.coefficients
-
-      val a2 = coefficients(0)
-      val a1 = coefficients(1)
-      val b = coefficients(2)
-
-      val yPred = x.map(xi => a2 * xi * xi + a1 * xi + b)
-
-      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
-      val ssRes = sum((y - yPred) ^:^ 2.0)
-      val rSquared = 1 - (ssRes / ssTotal)
-
-      logInfoSSP(s"Polynomial2d model for $opName: " +
-        s"y = $a2 * x^2 + $a1 * x + $b with R^2 $rSquared", isSSparkLogEnabled)
-      (a2, a1, b, rSquared) // coefficient a2, a1, and b
-    }
+    // if opName is a predictable , functional , constant....
     
-    def regression_polynomial3dModel(opName: String, 
-                                     readed: HashSet[(String, Double, Double)])
-                                    : (Double, Double, Double, Double, Double) = {
-      import breeze.linalg._
-      import breeze.stats.regression._
-      import breeze.numerics._
-      import breeze.stats._
-      
-      val x = DenseVector(readed.toSeq.map(_._2).toArray)
-      val y = DenseVector(readed.toSeq.map(_._3).toArray)
+    val x = DenseVector(readed.toSeq.map(_._2).toArray)
+    val y = DenseVector(readed.toSeq.map(_._3).toArray)
 
-      val X = DenseMatrix.horzcat(
-        x.map(xi => xi * xi * xi).asDenseMatrix.t, 
-        x.map(xi => xi * xi).asDenseMatrix.t,      
-        x.asDenseMatrix.t,                         
-        DenseMatrix.ones[Double](x.length, 1)      
-      )
-      val leastSquaresResult = leastSquares(X, y)
-      val coefficients = leastSquaresResult.coefficients
+    val logX = breeze.numerics.log(x)
+    val logY = breeze.numerics.log(y)
 
-      val a3 = coefficients(0)
-      val a2 = coefficients(1)
-      val a1 = coefficients(2)
-      val b = coefficients(3)
+    val X = DenseMatrix.horzcat(logX.asDenseMatrix.t, DenseMatrix.ones[Double](logX.length, 1))
 
-      val yPred = x.map(xi => a3 * xi * xi * xi + a2 * xi * xi + a1 * xi + b)
+    val leastSquaresResult = leastSquares(X, logY)
+    val coefficients = leastSquaresResult.coefficients
 
-      val ssTotal = sum((y - mean(y)) ^:^ 2.0)
-      val ssRes = sum((y - yPred) ^:^ 2.0)
-      val rSquared = 1 - (ssRes / ssTotal)
+    val a = math.exp(coefficients(1))
+    val b = coefficients(0)
 
-      logInfoSSP(s"Polynomial3d model for $opName: " +
-        s"y = $a3 * x^3 + $a2 * x^2 + $a1 * x + $b with R^2 $rSquared", isSSparkLogEnabled)
-      (a3, a2, a1, b, rSquared) // coefficient a3, a2, a1, and b
-    }
+    val yPred = x.map(xi => a * math.pow(xi, b))
 
-    def y_powerModel(coeffA: Double, coeffB: Double, x: Double)
+    val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+    val ssRes = sum((y - yPred) ^:^ 2.0)
+    val rSquared = 1 - (ssRes / ssTotal)
+
+    logInfoSSP(s"Power model for $opName: y = $a * x^$b with R^2 $rSquared", isSSparkLogEnabled)
+    (a, b, rSquared)  // coefficient a and b
+  }
+
+  def regression_linearModel(opName: String, 
+                              readed: HashSet[(String, Double, Double)])
+                            : (Double, Double, Double) = {
+    import breeze.linalg._
+    import breeze.stats.regression._
+    import breeze.numerics._
+    import breeze.stats._
+
+    val x = DenseVector(readed.toSeq.map(_._2).toArray)
+    val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+    val X = DenseMatrix.horzcat(x.asDenseMatrix.t, DenseMatrix.ones[Double](x.length, 1))
+
+    val leastSquaresResult = leastSquares(X, y)
+    val coefficients = leastSquaresResult.coefficients
+
+    val a = coefficients(0)
+    val b = coefficients(1)
+    
+    val yPred = x.map(xi => a * xi + b)
+
+    val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+    val ssRes = sum((y - yPred) ^:^ 2.0)
+    val rSquared = 1 - (ssRes / ssTotal)
+
+    logInfoSSP(s"Linear model for $opName: " +
+      s"y = $a * x + $b with R^2 $rSquared", isSSparkLogEnabled)
+    (a, b, rSquared)  // coefficient a and b
+  }
+
+  def regression_polynomial2dModel(opName: String, 
+                                    readed: HashSet[(String, Double, Double)])
+                                  : (Double, Double, Double, Double) = {
+    import breeze.linalg._
+    import breeze.stats.regression._
+    import breeze.numerics._
+    import breeze.stats._
+    
+    val x = DenseVector(readed.toSeq.map(_._2).toArray)
+    val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+    val X = DenseMatrix.horzcat(
+      x.map(xi => xi * xi).asDenseMatrix.t, 
+      x.asDenseMatrix.t,                    
+      DenseMatrix.ones[Double](x.length, 1) 
+    )
+    val leastSquaresResult = leastSquares(X, y)
+    val coefficients = leastSquaresResult.coefficients
+
+    val a2 = coefficients(0)
+    val a1 = coefficients(1)
+    val b = coefficients(2)
+
+    val yPred = x.map(xi => a2 * xi * xi + a1 * xi + b)
+
+    val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+    val ssRes = sum((y - yPred) ^:^ 2.0)
+    val rSquared = 1 - (ssRes / ssTotal)
+
+    logInfoSSP(s"Polynomial2d model for $opName: " +
+      s"y = $a2 * x^2 + $a1 * x + $b with R^2 $rSquared", isSSparkLogEnabled)
+    (a2, a1, b, rSquared) // coefficient a2, a1, and b
+  }
+  
+  def regression_polynomial3dModel(opName: String, 
+                                    readed: HashSet[(String, Double, Double)])
+                                  : (Double, Double, Double, Double, Double) = {
+    import breeze.linalg._
+    import breeze.stats.regression._
+    import breeze.numerics._
+    import breeze.stats._
+    
+    val x = DenseVector(readed.toSeq.map(_._2).toArray)
+    val y = DenseVector(readed.toSeq.map(_._3).toArray)
+
+    val X = DenseMatrix.horzcat(
+      x.map(xi => xi * xi * xi).asDenseMatrix.t, 
+      x.map(xi => xi * xi).asDenseMatrix.t,      
+      x.asDenseMatrix.t,                         
+      DenseMatrix.ones[Double](x.length, 1)      
+    )
+    val leastSquaresResult = leastSquares(X, y)
+    val coefficients = leastSquaresResult.coefficients
+
+    val a3 = coefficients(0)
+    val a2 = coefficients(1)
+    val a1 = coefficients(2)
+    val b = coefficients(3)
+
+    val yPred = x.map(xi => a3 * xi * xi * xi + a2 * xi * xi + a1 * xi + b)
+
+    val ssTotal = sum((y - mean(y)) ^:^ 2.0)
+    val ssRes = sum((y - yPred) ^:^ 2.0)
+    val rSquared = 1 - (ssRes / ssTotal)
+
+    logInfoSSP(s"Polynomial3d model for $opName: " +
+      s"y = $a3 * x^3 + $a2 * x^2 + $a1 * x + $b with R^2 $rSquared", isSSparkLogEnabled)
+    (a3, a2, a1, b, rSquared) // coefficient a3, a2, a1, and b
+  }
+
+  def y_powerModel(coeffA: Double, coeffB: Double, x: Double)
+                  : Double = {
+    //xi => a * math.pow(xi, b)
+    coeffA * math.pow(x, coeffB)
+  }
+  def y_linearModel(coeffA: Double, coeffB: Double, x: Double)
                     : Double = {
-      //xi => a * math.pow(xi, b)
-      coeffA * math.pow(x, coeffB)
-    }
-    def y_linearModel(coeffA: Double, coeffB: Double, x: Double)
-                     : Double = {
-      //xi => a * xi + b
-      coeffA * x + coeffB
-    }
-    def y_polynomial2dModel(coeffA2: Double, coeffA1: Double, coeffB: Double, x: Double)
-                           : Double = {
-      //xi => a2 * xi * xi + a1 * xi + b
-      coeffA2 * x * x + coeffA1 * x + coeffB
-    }
-    def y_polynomial3dModel(coeffA3: Double, coeffA2: Double, coeffA1: Double, coeffB: Double, x: Double): 
-                            Double = {
-      //xi => a3 * xi * xi * xi + a2 * xi * xi + a1 * xi + b
-      coeffA3 * x * x * x + coeffA2 * x * x + coeffA1 * x + coeffB
-    }
+    //xi => a * xi + b
+    coeffA * x + coeffB
+  }
+  def y_polynomial2dModel(coeffA2: Double, coeffA1: Double, coeffB: Double, x: Double)
+                          : Double = {
+    //xi => a2 * xi * xi + a1 * xi + b
+    coeffA2 * x * x + coeffA1 * x + coeffB
+  }
+  def y_polynomial3dModel(coeffA3: Double, coeffA2: Double, coeffA1: Double, coeffB: Double, x: Double): 
+                          Double = {
+    //xi => a3 * xi * xi * xi + a2 * xi * xi + a1 * xi + b
+    coeffA3 * x * x * x + coeffA2 * x * x + coeffA1 * x + coeffB
+  }
 
-    // opId = opName(newCallSite), sizeOrTime = "size" or "time"
-    def readProfiling(opId: String, sizeOrTime: String): (String, HashSet[(String, Double, Double)]) = { 
-      val opName = opId.split('(')(0)
-      val filePath = Paths.get(profilingDir + "/" + opName + "_" + sizeOrTime + ".csv")
-      val readed = HashSet[(String, Double, Double)]()
-      if (Files.exists(filePath)) {
-        val fileReader = Source.fromFile(filePath.toString)
-        for (line <- fileReader.getLines()) {
-          val tmpTokens = line.split(',')
-          val candName = tmpTokens(0)//,filterNot(_.isWhitespace)
-          val firstItem = tmpTokens(1).toDouble   // input size
-          val secondItem = tmpTokens(2).toDouble  // time from _time, output size from _size
-          readed.add( (candName, firstItem, secondItem) ) // duplicated value will be eliminated
-        }
-        fileReader.close()
+  // opId = opName(newCallSite), sizeOrTime = "size" or "time"
+  def readProfiling(opId: String, sizeOrTime: String): (String, HashSet[(String, Double, Double)]) = { 
+    val opName = opId.split('(')(0)
+    val filePath = Paths.get(profilingDir + "/" + opName + "_" + sizeOrTime + ".csv")
+    val readed = HashSet[(String, Double, Double)]()
+    if (Files.exists(filePath)) {
+      val fileReader = Source.fromFile(filePath.toString)
+      for (line <- fileReader.getLines()) {
+        val tmpTokens = line.split(',')
+        val candName = tmpTokens(0)//,filterNot(_.isWhitespace)
+        val firstItem = tmpTokens(1).toDouble   // input size
+        val secondItem = tmpTokens(2).toDouble  // time from _time, output size from _size
+        readed.add( (candName, firstItem, secondItem) ) // duplicated value will be eliminated
       }
-      (opName, readed)
+      fileReader.close()
     }
-    
-    // start point of selectCandidates
-    val lineage = getLineage(stageId)
+    (opName, readed)
+  }
 
-    def makeOpId(rddId: Int): String = {
-      val localLineage = lineages.find(x => x._2.contains(rddId))
-      if (localLineage.isDefined) {
-        val node = localLineage.get._2.get(rddId)
-        s"${node.get.name}(${node.get.callSite})"
+  def makeOpId(rddId: Int): String = {
+    val localLineage = lineages.values.flatMap(_.values).find(_.contains(rddId))
+    if (localLineage.isDefined) {
+      val node = localLineage.get.get(rddId)
+      s"${node.get.name}(${node.get.callSite})"
+    }
+    else {
+      logErrorSSP(s"Cannot get node ${rddId}")
+      ""
+    }
+  }
+
+  def makeCandidatesOnStage(candidatesOnLineage: LinkedHashMap[Int, LineageInfo])
+    : (LinkedHashSet[CandidatesInfo], LinkedHashSet[CandidatesInfo]) = {
+    val result = (LinkedHashSet[CandidatesInfo](), LinkedHashSet[CandidatesInfo]())
+    val leafNode = candidatesOnLineage.head._1
+
+    def self(rddId: Int, result: LinkedHashSet[CandidatesInfo]): Unit = {
+      candidatesOnLineage.find(x => x._1 == rddId) match {
+        case Some(node) =>
+          val opId = makeOpId(node._1)
+          val parents = node._2.deps
+          val parentsId = HashSet[String]()
+          parents.filterNot(x => x == -1 || x == -2 || x == -3).foreach{ x =>
+            parentsId.add(makeOpId(x))
+          }
+          cacheCandidates.find(x => x.opId == opId && x.parents.equals(parentsId)) match {
+            case Some(candidate) =>
+              result += candidate
+            case None =>
+          }
+          parents.filter(x => candidatesOnLineage.contains(x)).foreach(self(_, result))
+        case None =>
+      }
+    }
+    self(leafNode, result._1)
+    result._1.foreach { x =>
+      x.inputSize = 0
+      x.resultSize = 0
+      x.time = 0
+      val remainingCounts = x.counts - 1
+      if (unpersistPlan) {
+        if (remainingCounts > -1) {
+          x.counts = remainingCounts
+        }
+        else {
+          result._1.remove(x)
+          result._2.add(x)
+        }
       }
       else {
-        logErrorSSP(s"Cannot get node ${rddId}")
-        ""
+        x.counts = remainingCounts
+      }
+    }
+    result
+  }
+
+  def getValueFromRegression(readed: HashSet[(String, Double, Double)], 
+                              opName: String, 
+                              inputSize: Double, 
+                              sizeOrTime: String): Double = {
+    var resultValue: Double = 0 // this value should be time or resultSize
+    try {
+      if (readed.size > 1) {
+        logInfoSSP(s"Try to makeRegressionModel LINEAR $sizeOrTime for $opName", isSSparkLogEnabled)
+        val (a, b, rSquared) = regression_linearModel(opName, readed)
+        if (rSquared < 0.75) {
+          logInfoSSP(s"Try to makeRegressionModel POLY2DIM for $sizeOrTime $opName", isSSparkLogEnabled)
+          val (a2, a1, b, rSquared) = regression_polynomial2dModel(opName, readed)
+          if (rSquared < 0.75) {
+            logInfoSSP(s"Try to makeRegressionModel POLY3DIM for $sizeOrTime $opName", isSSparkLogEnabled)
+            val (a3, a2, a1, b, rSquared) = regression_polynomial3dModel(opName, readed)
+            resultValue = y_polynomial3dModel(a3, a2, a1, b, inputSize)
+          }
+          else {
+            resultValue = y_polynomial2dModel(a2, a1, b, inputSize)
+          }
+        }
+        else {
+          resultValue = y_linearModel(a, b, inputSize)
+        }
+      }
+    } catch {
+      case e: Exception =>
+        isSSparkOptimizeEnabled = false
+        logWarningSSP(s"cannot find a regressionModel for ${opName}... OptimizeEnabled has set false")
+    }
+    if (resultValue < 0) {
+      logWarningSSP(s"Predicted Y $sizeOrTime value of $opName is $resultValue -> 0", isSSparkLogEnabled)
+      resultValue = 0
+    }
+    else {
+      logInfoSSP(s"Predicted Y $sizeOrTime value of $opName  = $resultValue", isSSparkLogEnabled)
+    }
+    
+    resultValue
+  }
+
+  def setSizeOfCandidates(ancestors: LinkedHashSet[CandidatesInfo], stageInput: Long): Unit = { // Top-down
+    val visited = HashSet[CandidatesInfo]()
+    def self(node: CandidatesInfo): Unit = {
+      visited.add(node)
+      val op = node.opId.split('(')(0)
+      var resultSize: Double = 0
+      val (opName, readedSize) = readProfiling(node.opId, "size")
+        readedSize ++= dagScheduler.opOutPerIn.filter(x => x._1.startsWith(opName+"("))
+                                .map{x => 
+                                  logInfoSSP(s"added accumulator size info. ${(x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / Math.pow(2,20))}", isSSparkLogEnabled)
+                                  (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / Math.pow(2,20))
+                                }
+
+      if (functionalOps.contains(op)) { 
+        val readedWithSameOpId = readedSize.filter(_._1 == node.opId)
+        resultSize = getValueFromRegression(readedWithSameOpId, opName, node.inputSize, "size")
+      }
+      /* Don't need to distinguish constantOps 
+      else if (constantOps.contains(op)){
+        resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
+      } */
+      else {  // predictable
+        resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
+      }
+
+      node.resultSize = resultSize  
+      val children = ancestors.filter(x => x.parents.contains(node.opId)).filterNot(x => visited.contains(x))
+      logInfoSSP(s"Node visited ${node.opId} -> ${children.map(_.opId)}")
+      children.foreach { x =>   
+        x.inputSize += resultSize
+        self(x)
       }
     }
 
+    val rootNode = ancestors.find(x => x.opId == makeOpId(rootLineage.last))
+      // ancestors.find(_.parents.isEmpty)
+    rootNode match {
+      case Some(x) =>
+        x.inputSize = stageInput / Math.pow(2,20)
+        self(x)
+      case None => 
+        logErrorSSP(s"Cannot find root node in persist candidates RDD id ${rootLineage.last}")
+    }
+  }
+
+  // Do not need Top-down, because time can be calculated by inputSize of itself
+  def setTimeOfCandidates(ancestors: LinkedHashSet[CandidatesInfo]): Unit = {
+    ancestors.foreach{ node =>
+      val op = node.opId.split('(')(0)
+      var resultTime: Double = 0
+      val (opName, readedTime) = readProfiling(node.opId, "time")
+      readedTime ++= dagScheduler.opTimePerIn.filter(x => x._1.startsWith(opName+"("))
+                              .map{x => 
+                                logInfoSSP(s"added accumulator time info. ${(x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / 1e9)}", isSSparkLogEnabled)
+                                (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / 1e9)
+                              }
+
+      if (functionalOps.contains(op)) { 
+        //HashSet[(String, Double, Double)
+        val readedWithSameOpId = readedTime.filter(_._1 == node.opId)
+        resultTime = getValueFromRegression(readedWithSameOpId, opName, node.inputSize, "time")
+      }
+      else if (constantOps.contains(op)){
+        resultTime = readedTime.maxBy(_._3)._3
+      } 
+      else {  // predictable
+        resultTime = getValueFromRegression(readedTime, opName, node.inputSize, "time")
+      }
+      node.time = resultTime
+    }
+  }
+  
+  def findTopNodes(ancestors: LinkedHashSet[CandidatesInfo]): LinkedHashSet[CandidatesInfo] = {
+    ancestors.filter(node => node.parents.isEmpty)
+  }
+
+  def calculateBenefitFromTopDown(
+                                    node: CandidatesInfo,
+                                    selectedNodes: HashSet[String],
+                                    allNodes: LinkedHashSet[CandidatesInfo],
+                                    benefit: Double,
+                                    currentTime: Double
+                                  ): Double = {
+    var accumulatedBenefit = benefit
+    var accumulatedTime = currentTime + node.time
+
+    if (selectedNodes.contains(node.opId)) {
+      accumulatedBenefit += accumulatedTime * node.counts 
+      // counts has reduced already by calling makeCandidatesOnStage() (getAncestors())
+      accumulatedTime = 0.0
+    }
+    for (child <- allNodes.filter(_.parents.contains(node.opId))) {
+      accumulatedBenefit = calculateBenefitFromTopDown(child, selectedNodes, allNodes, 
+                                                      accumulatedBenefit, accumulatedTime)
+    }
+    accumulatedBenefit
+  }
+
+  def generateCombinations(ancestors: LinkedHashSet[CandidatesInfo]): HashSet[CandidatesCombination] = {
+    val combinations = new HashSet[CandidatesCombination]()
+    val topNodes = findTopNodes(ancestors)
+    val totalCombinations = 1 << ancestors.size // 2^n
+    val ancestorsList = ancestors.toList
+
+    for (i <- 0 until totalCombinations) {
+      val combination = new CandidatesCombination()
+
+      for (j <- ancestorsList.indices) {
+        if ((i & (1 << j)) != 0) {
+          val node = ancestorsList(j)
+          combination.nodes.add(node.opId)
+          combination.sumSize += node.resultSize
+        }
+      }
+
+      for (topNode <- topNodes) {
+        combination.benefit += calculateBenefitFromTopDown(topNode, combination.nodes, ancestors, 0.0, 0.0)
+      }
+      combinations.add(combination)
+    }
+    combinations
+  }
+
+  def findBestCombination(combinations: HashSet[CandidatesCombination], 
+                          remainingMem: Double): Option[CandidatesCombination] = {
+    val validCombinations = combinations.filter(_.sumSize <= remainingMem)
+    
+    if (validCombinations.nonEmpty) {
+      Some(validCombinations.maxBy(c => (c.benefit, -c.sumSize))) // maximize benefit, minimize sumSize
+    } else {
+      None
+    }
+  }
+    
+  def selectCandidates(stageId: Int, stageInput: Long): Unit = {
     @deprecated // inner function of getAncestors
     def findAncestors(nodeId: String, result: LinkedHashSet[CandidatesInfo]): Unit = {
       cacheCandidates.find(_.opId == nodeId) match {
@@ -2625,216 +2840,9 @@ class SparkContext(config: SparkConf) extends Logging {
       result
     }
 
-    def makeCandidatesOnStage(candidatesOnLineage: LinkedHashMap[Int, LineageInfo])
-    : (LinkedHashSet[CandidatesInfo], LinkedHashSet[CandidatesInfo]) = {
-      val result = (LinkedHashSet[CandidatesInfo](), LinkedHashSet[CandidatesInfo]())
-      val leafNode = candidatesOnLineage.head._1
+    // start point of selectCandidates
+    val lineage = getLineage(stageId)
 
-      def self(rddId: Int, result: LinkedHashSet[CandidatesInfo]): Unit = {
-        candidatesOnLineage.find(x => x._1 == rddId) match {
-          case Some(node) =>
-            val opId = makeOpId(node._1)
-            val parents = node._2.deps
-            val parentsId = HashSet[String]()
-            parents.filterNot(x => x == -1 || x == -2 || x == -3).foreach{ x =>
-              parentsId.add(makeOpId(x))
-            }
-            cacheCandidates.find(x => x.opId == opId && x.parents.equals(parentsId)) match {
-              case Some(candidate) =>
-                result += candidate
-              case None =>
-            }
-            parents.filter(x => candidatesOnLineage.contains(x)).foreach(self(_, result))
-          case None =>
-        }
-      }
-      self(leafNode, result._1)
-      result._1.foreach { x =>
-        x.inputSize = 0
-        x.resultSize = 0
-        x.time = 0
-        val remainingCounts = x.counts - 1
-        if (unpersistPlan) {
-          if (remainingCounts > -1) {
-            x.counts = remainingCounts
-          }
-          else {
-            result._1.remove(x)
-            result._2.add(x)
-          }
-        }
-        else {
-          x.counts = remainingCounts
-        }
-      }
-      result
-    }
-
-    def getValueFromRegression(readed: HashSet[(String, Double, Double)], 
-                               opName: String, 
-                               inputSize: Double, 
-                               sizeOrTime: String): Double = {
-      var resultValue: Double = 0 // this value should be time or resultSize
-      try {
-        if (readed.size > 1) {
-          logInfoSSP(s"Try to makeRegressionModel LINEAR $sizeOrTime for $opName", isSSparkLogEnabled)
-          val (a, b, rSquared) = regression_linearModel(opName, readed)
-          if (rSquared < 0.75) {
-            logInfoSSP(s"Try to makeRegressionModel POLY2DIM for $sizeOrTime $opName", isSSparkLogEnabled)
-            val (a2, a1, b, rSquared) = regression_polynomial2dModel(opName, readed)
-            if (rSquared < 0.75) {
-              logInfoSSP(s"Try to makeRegressionModel POLY3DIM for $sizeOrTime $opName", isSSparkLogEnabled)
-              val (a3, a2, a1, b, rSquared) = regression_polynomial3dModel(opName, readed)
-              resultValue = y_polynomial3dModel(a3, a2, a1, b, inputSize)
-            }
-            else {
-              resultValue = y_polynomial2dModel(a2, a1, b, inputSize)
-            }
-          }
-          else {
-            resultValue = y_linearModel(a, b, inputSize)
-          }
-        }
-      } catch {
-        case e: Exception =>
-          isSSparkOptimizeEnabled = false
-          logErrorSSP(s"cannot find a regressionModel... OptimizeEnabled has set false")
-      }
-      resultValue
-    }
-
-    def setSizeOfCandidates(ancestors: LinkedHashSet[CandidatesInfo]): Unit = { // Top-down
-      val visited = HashSet[CandidatesInfo]()
-      def self(node: CandidatesInfo): Unit = {
-        visited.add(node)
-        val op = node.opId.split('(')(0)
-        var resultSize: Double = 0
-        val (opName, readedSize) = readProfiling(node.opId, "size")
-          readedSize ++= opOutPerInAccum.filter(x => x._1.startsWith(opName+"("))
-                                  .map{x => 
-                                    (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / Math.pow(2,20))
-                                  }
-
-        if (functionalOps.contains(op)) { 
-          val readedWithSameOpId = readedSize.filter(_._1 == node.opId)
-          resultSize = getValueFromRegression(readedWithSameOpId, opName, node.inputSize, "size")
-        }
-        /* Don't need to distinguish constantOps 
-        else if (constantOps.contains(op)){
-          resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
-        } */
-        else {  // predictable
-          resultSize = getValueFromRegression(readedSize, opName, node.inputSize, "size")
-        }
-
-        node.resultSize = resultSize  
-        val children = ancestors.filter(x => x.parents.contains(node.opId)).filterNot(x => visited.contains(x))
-        logInfoSSP(s"Node visited ${node.opId} -> ${children.map(_.opId)}")
-        children.foreach { x =>   
-          x.inputSize += resultSize
-          self(x)
-        }
-      }
-
-      val rootNode = ancestors.find(x => x.opId == makeOpId(rootLineage.last))
-        // ancestors.find(_.parents.isEmpty)
-      rootNode match {
-        case Some(x) =>
-          x.inputSize = stageInput / Math.pow(2,20)
-          self(x)
-        case None => 
-          logErrorSSP(s"Cannot find root node in persist candidates RDD id ${rootLineage.last}")
-      }
-    }
-
-    // Do not need Top-down, because time can be calculated by inputSize of itself
-    def setTimeOfCandidates(ancestors: LinkedHashSet[CandidatesInfo]): Unit = {
-      ancestors.foreach{ node =>
-        val op = node.opId.split('(')(0)
-        var resultTime: Double = 0
-        val (opName, readedTime) = readProfiling(node.opId, "time")
-        readedTime ++= opTimePerInAccum.filter(x => x._1.startsWith(opName+"("))
-                                .map{x => 
-                                  (x._1, x._2.toFloat / Math.pow(2,20), x._3.toFloat / 1e9)
-                                }
-
-        if (functionalOps.contains(op)) { 
-          //HashSet[(String, Double, Double)
-          val readedWithSameOpId = readedTime.filter(_._1 == node.opId)
-          resultTime = getValueFromRegression(readedWithSameOpId, opName, node.inputSize, "time")
-        }
-        else if (constantOps.contains(op)){
-          resultTime = readedTime.maxBy(_._3)._3
-        } 
-        else {  // predictable
-          resultTime = getValueFromRegression(readedTime, opName, node.inputSize, "time")
-        }
-        node.time = resultTime
-      }
-    }
-    
-    def findTopNodes(ancestors: LinkedHashSet[CandidatesInfo]): LinkedHashSet[CandidatesInfo] = {
-      ancestors.filter(node => node.parents.isEmpty)
-    }
-
-    def calculateBenefitFromTopDown(
-                                     node: CandidatesInfo,
-                                     selectedNodes: HashSet[String],
-                                     allNodes: LinkedHashSet[CandidatesInfo],
-                                     benefit: Double,
-                                     currentTime: Double
-                                   ): Double = {
-      var accumulatedBenefit = benefit
-      var accumulatedTime = currentTime + node.time
-
-      if (selectedNodes.contains(node.opId)) {
-        accumulatedBenefit += accumulatedTime * node.counts 
-        // counts has reduced already by calling makeCandidatesOnStage() (getAncestors())
-        accumulatedTime = 0.0
-      }
-      for (child <- allNodes.filter(_.parents.contains(node.opId))) {
-        accumulatedBenefit = calculateBenefitFromTopDown(child, selectedNodes, allNodes, 
-                                                        accumulatedBenefit, accumulatedTime)
-      }
-      accumulatedBenefit
-    }
-
-    def generateCombinations(ancestors: LinkedHashSet[CandidatesInfo]): HashSet[CandidatesCombination] = {
-      val combinations = new HashSet[CandidatesCombination]()
-      val topNodes = findTopNodes(ancestors)
-      val totalCombinations = 1 << ancestors.size // 2^n
-      val ancestorsList = ancestors.toList
-
-      for (i <- 0 until totalCombinations) {
-        val combination = new CandidatesCombination()
-
-        for (j <- ancestorsList.indices) {
-          if ((i & (1 << j)) != 0) {
-            val node = ancestorsList(j)
-            combination.nodes.add(node.opId)
-            combination.sumSize += node.resultSize
-          }
-        }
-
-        for (topNode <- topNodes) {
-          combination.benefit += calculateBenefitFromTopDown(topNode, combination.nodes, ancestors, 0.0, 0.0)
-        }
-        combinations.add(combination)
-      }
-      combinations
-    }
-
-    def findBestCombination(combinations: HashSet[CandidatesCombination], 
-                            remainingMem: Double): Option[CandidatesCombination] = {
-      val validCombinations = combinations.filter(_.sumSize <= remainingMem)
-      
-      if (validCombinations.nonEmpty) {
-        Some(validCombinations.maxBy(c => (c.benefit, -c.sumSize))) // maximize benefit, minimize sumSize
-      } else {
-        None
-      }
-    }
-    
     val candidatesOnLineage = lineage.filter { x =>
       val opId = makeOpId(x._1)
       cacheCandidates.exists(x => x.opId == opId)
@@ -2858,7 +2866,7 @@ class SparkContext(config: SparkConf) extends Logging {
                                                 However, in the previous stage, (map<-distinct) node is already scheduled as a candidate
                                                 So, it seems fine to skip for the (distinct<-distinct)
                                             */
-        setSizeOfCandidates(candidatesOnStage._1)
+        setSizeOfCandidates(candidatesOnStage._1, stageInput)
         val remainingMem = getRemainingStorageMem() / Math.pow(2,20)
         val maxSizeOfCandidates: Double = candidatesOnStage._1.toSeq.map(_.resultSize).sum
         var localCacheList = HashSet[String]()
@@ -2878,6 +2886,7 @@ class SparkContext(config: SparkConf) extends Logging {
         else {  // insufficient memory
           setTimeOfCandidates(candidatesOnStage._1)
           val combinations = generateCombinations(candidatesOnStage._1)
+          logInfoSSP(s"Combinations ${combinations}", isSSparkLogEnabled)
           val bestCombination = findBestCombination(combinations, remainingMem)
         
           bestCombination match {
@@ -2917,10 +2926,16 @@ class SparkContext(config: SparkConf) extends Logging {
   }
   
   // use LinkedHashMap for ordering of lineage
-  val lineages = HashMap[Int, LinkedHashMap[Int, LineageInfo]]()  // K=stageId, V=stageLineage, stageLineage's deps are its parents
+  val lineages = HashMap[Int, HashMap[Int, LinkedHashMap[Int, LineageInfo]]]() // [ JobId, [ StageId, Lineage ] ]
   val rootLineage = HashSet[Int]()  // SSPARK TODO: it doens't need to be HashSet, just a scalar value
+  val rootName = HashSet[String]()
+  
+  def putLineage(jobId: Int, stageId: Int, value: LinkedHashMap[Int, LineageInfo]): Unit = {
+    lineages.getOrElseUpdate(jobId, HashMap()).put(stageId, value)
+  }
+
   def getLineage(stageId: Int): LinkedHashMap[Int, LineageInfo] = {
-    lineages.get(stageId) match {
+    lineages.values.flatMap(_.get(stageId)).headOption match {
       case Some(x) => x
       case None =>
         logErrorSSP(s"$stageId lineage does not exist")
@@ -2989,11 +3004,6 @@ class SparkContext(config: SparkConf) extends Logging {
       }
     rootLineage
   }
-
-  def addActionLineage(lineage: LinkedHashMap[Int, LineageInfo]): Unit = {  // don't know this is necessary
-    lineage.put(-3, new LineageInfo("", "action"))
-    lineage.get(-3).get.addDeps(lineage.head._1)
-  }
   
   def getOpName(rdd: RDD[_]): String = {  // maybe don't need anymore
     val tmpStr = rdd.toString.split(" at ")
@@ -3012,9 +3022,9 @@ class SparkContext(config: SparkConf) extends Logging {
    * SSPARK: Make a lineage for each task or job
    * To adopt an optimization approach, a lineage must be created for each task.
    */ 
-  def makeLineage(stageId: Int, rdd: RDD[_]): Unit = {
+  def makeLineage(jobId: Int, stageId: Int, rdd: RDD[_]): Unit = {
     val lineage = new LinkedHashMap[Int, LineageInfo]()
-    def selfInfo(rdd: RDD[_]): Unit ={
+    def selfInfo(rdd: RDD[_]): Unit = {
       val len = rdd.dependencies.length
       len match{
         case 0 => 
@@ -3103,11 +3113,14 @@ class SparkContext(config: SparkConf) extends Logging {
     //lineage.clear()
     
     rootLineage.clear()
+    rootName.clear()
     selfInfo(rdd)
-    lineages.put(stageId, lineage)
+    //lineages.put(stageId, lineage)
+    putLineage(jobId, stageId, lineage)
     rootLineage.add(getRootLineage(lineage))
+    rootName.add(lineage(getRootLineage(lineage)).name)
     logInfoSSP(s"Lineage was made with root ${rootLineage} $lineage \n ${rdd.toDebugString} \n" +
-      s"Stage $stageId cachePlan [$cachePlan] cacheList: $cacheList"
+      s"Job $jobId Stage $stageId cachePlan [$cachePlan] cacheList: $cacheList"
     , isSSparkLogEnabled)
   }
   
@@ -3166,22 +3179,25 @@ class SparkContext(config: SparkConf) extends Logging {
     rdg.get(rdg.minBy(_._1)._1).get.callSite.split('(')(0).split('.')(0) + ".rdg"
   }
 
-  def makeRDG(lineages: HashMap[Int, LinkedHashMap[Int, LineageInfo]]): HashMap[Int, LineageInfo] = {
+  def makeRDG(lineages: HashMap[Int, HashMap[Int, LinkedHashMap[Int, LineageInfo]]]): HashMap[Int, LineageInfo] = {
     val rdg = HashMap[Int, LineageInfo]()
 
     def findChildren(rdd: Int): HashSet[Int] = {
       val children = HashSet[Int]()
-      lineages.foreach { stageLineage =>
-        val nodeInfo = stageLineage._2.filter(x => x._2.deps.contains(rdd))
-        nodeInfo.foreach(x => children.add(x._1))
+      lineages.foreach { jobLineage =>
+        jobLineage._2.foreach { stageLineage =>
+          val nodeInfo = stageLineage._2.filter(x => x._2.deps.contains(rdd))
+          nodeInfo.foreach(x => children.add(x._1))
+        }
       }
       children
     }
 
     def addNode(rdd: Int): Unit = {
-      val node = lineages.find(_._2.contains(rdd)).get._2.find(_._1 == rdd).get
+      val node = lineages.values.flatMap(_.values).find(_.contains(rdd)).get.find(_._1 == rdd).get
       rdg.put(rdd, new LineageInfo(node._2.name, node._2.callSite))
-      rdg.get(rdd).get.addDeps(findChildren(rdd))
+      val children = findChildren(rdd)
+      rdg.get(rdd).get.addDeps(children)
     }
 
     def selfInfo(rdd: Int): Unit = {
@@ -3202,7 +3218,20 @@ class SparkContext(config: SparkConf) extends Logging {
       findParent(rdd).map(countActions(_))
     }
 
-    val root = lineages.minBy(x => x._1)._2.minBy(x => x._1)._1 // normally it should be 0
+    def addActionLineages(): Unit = {
+      val maxRdd = lineages.values.flatMap(_.values).flatMap(_.keys).max + 1
+
+      for (jobId <- 0 to lineages.size - 1) {
+        val lastStage = lineages(jobId).maxBy(_._1)._1
+        val lineage = getLineage(lastStage)
+        val lastNode = lineage.head._1
+        lineage.put(maxRdd + jobId, new LineageInfo("Action", s"Job$jobId"))
+        lineage.get(maxRdd + jobId).get.addDeps(lastNode)
+      }
+    }
+    
+    addActionLineages()
+    val root = lineages.minBy(_._1)._2.minBy(_._1)._2.minBy(_._1)._1 // normally it should be 0
     selfInfo(root)
     val leafNodes = HashSet[Int]()
     rdg.filter(_._2.deps.size == 0).foreach(x => leafNodes.add(x._1))
@@ -3278,6 +3307,7 @@ class SparkContext(config: SparkConf) extends Logging {
     storageStatus.filter(_.blockManagerId.executorId != "driver").map(_.memRemaining).sum
   }
 
+  /*
   def profilingTrim(dirPath: String): Unit = {
     val dir = new File(dirPath)
     val profilingFiles = dir.listFiles.filter(file => file.isFile && file.getName.endsWith(".csv"))
@@ -3288,6 +3318,47 @@ class SparkContext(config: SparkConf) extends Logging {
         val trimmedLines = lines.takeRight(maxProfiling)
         val writer = new PrintWriter(file)
         trimmedLines.foreach(writer.println)
+        writer.close()
+      }
+    }
+  }*/
+
+  def profilingTrim(dirPath: String): Unit = {
+    val dir = new File(dirPath)
+    val profilingFiles = dir.listFiles.filter(file => file.isFile && file.getName.endsWith(".csv"))
+
+    profilingFiles.foreach { file =>
+      val lines = Source.fromFile(file).getLines().toList
+
+      // Parse lines into structured data
+      val parsedData = lines.map { line =>
+        val parts = line.split(",").map(_.trim)
+        (parts(0), parts(1).toDouble, parts(2).toDouble)
+      }
+
+      // Group by the first two elements and calculate the average of the third element
+      val aggregatedData = parsedData
+        .groupBy { case (key1, key2, _) => (key1, key2) }
+        .map { case ((key1, key2), group) =>
+          val avgThird = group.map(_._3).sum / group.size
+          (key1, key2, avgThird)
+        }
+        .toList
+
+      // Limit the number of lines to maxProfiling if necessary
+      val trimmedData = if (aggregatedData.size > maxProfiling) {
+        aggregatedData.takeRight(maxProfiling)
+      } else {
+        aggregatedData
+      }
+
+      // Write back to the file
+      val writer = new PrintWriter(file)
+      try {
+        trimmedData.foreach { case (key1, key2, avgThird) =>
+          writer.println(s"$key1, $key2, $avgThird")
+        }
+      } finally {
         writer.close()
       }
     }

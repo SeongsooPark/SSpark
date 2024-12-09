@@ -331,11 +331,23 @@ abstract class RDD[T: ClassTag](
   var isCachedBlock = false  /** SSPARK: variable for checking really cached block of RDD, 
               it's not possible to check whether it's cached or not with original Spark's variable/value  */
   val rootLineage = sc.rootLineage
+  val rootName = sc.rootName
      
   private val isSSparkOptimizeEnabled = conf.getBoolean("spark.ssparkOptimize.enabled", false)
   private val isSSparkProfileEnabled = conf.getBoolean("spark.ssparkProfile.enabled", false)
   private val isSSparkLogEnabled = conf.getBoolean("spark.ssparkLog.enabled", false)
 
+  def isHadoopRDD(op: String): Boolean = {
+    if (op == "hadoopFile" ||
+        op == "objectFile" ||
+        op == "sequenceFile" ||
+        op == "textFile") {
+        true
+      }
+    else
+      false
+  }
+  
   def optimizeCache() = {
     // maybe need to change id 0 to rddname HadoopRDD
     //if (!sc.cacheCandidates.filter(x => x.opId == newCreationSite).isEmpty && this.id != 0) {
@@ -366,9 +378,10 @@ abstract class RDD[T: ClassTag](
 
       val (iterRet, iterLocal) = iteratorImpl(split, context).duplicate 
       // SSPARK: call original iterator(), make a duplicated iterator for returning and checking size   
-         
+      logInfoSSP(s"RDD name = ${rootName.last}")
       synchronized {
-        if (this.id != 0) {   // Data skew occurs when traversing the duplicated iterator of the first data block read from storage
+        //if (this.id != 0) {   // Data skew occurs when traversing the duplicated iterator of the first data block read from storage
+        if ( !(this.id == 0 && isHadoopRDD(rootName.last)) ) {
           val iterArray = iterLocal.toArray
           val iterSize = SizeEstimator.estimate(iterArray)
         

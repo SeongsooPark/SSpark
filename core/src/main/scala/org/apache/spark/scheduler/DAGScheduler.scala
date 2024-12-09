@@ -1097,7 +1097,7 @@ private[spark] class DAGScheduler(
         logDebug("missing: " + missing)
         if (missing.isEmpty) {
           if (isSSparkProfileEnabled) 
-            sc.makeLineage(stage.id, stage.rdd)  // SSPARK: make lineage on each Stage
+            sc.makeLineage(jobId.get, stage.id, stage.rdd)  // SSPARK: make lineage on each Stage
                     
           if (sc.isSSparkOptimizeEnabled) {
             val lineage = sc.getLineage(stage.id)
@@ -1940,12 +1940,23 @@ private[spark] class DAGScheduler(
         jobIdToActiveJob(jobId), "Job %d cancelled %s".format(jobId, reason.getOrElse("")))
     }
   }
+  
+  private def isHadoopRDD(op: String): Boolean = {
+    if (op == "hadoopFile" ||
+      op == "objectFile" ||
+      op == "sequenceFile" ||
+      op == "textFile") {
+      true
+    }
+    else
+      false
+  }
 
   /* 
    *  SSPARK: A function that calculates the RDD size by merging the sizes of each block based on the RDD id.
    */
   private def blockSizeToRddSize(blockSize: java.util.List[(Int, Long)], stageId: Int): HashMap[Int, Long] ={
-    val lineage = sc.lineages.get(stageId).get
+    val lineage = sc.getLineage(stageId)
     var rddSize = new HashMap[Int, Long]
     for(i <- 0 to blockSize.size()-1) {
       val cur = blockSize.get(i)
@@ -1971,12 +1982,13 @@ private[spark] class DAGScheduler(
    *  RDD time = sum times of corresponding blocks / sum times of all block times in the stage * time of stage
    */
   private def blockTimeToRddTime(blockTime: java.util.List[(Int, Long)], stageTime: Long, stageId: Int): HashMap[Int, Long] ={
-    val lineage = sc.lineages.get(stageId).get
+    val lineage = sc.getLineage(stageId)
     var rddTime = new HashMap[Int, Long]
     var sumBlockTime = 0L
     for(i <- 0 to blockTime.size()-1) {
       val cur = blockTime.get(i)
-      if(cur._1 == 0){ // only BlockTime has rdd 0, and it should be accumulated into rdd 1
+      //if(cur._1 == 0){ // only BlockTime has rdd 0, and it should be accumulated into rdd 1
+      if(cur._1 == 0 && isHadoopRDD(lineage(cur._1).name)) {
         if (rddTime.contains(1)) {
           rddTime(1) += cur._2
           sumBlockTime += cur._2
@@ -2067,7 +2079,7 @@ private[spark] class DAGScheduler(
       logErrorSSP("Couldn't find accumBlockSize value")
     */
 
-    logInfoSSP(s"Lineage ${stage.id} ${sc.lineages.get(stage.id)}", isSSparkLogEnabled) //
+    logInfoSSP(s"Lineage ${stage.id} ${sc.getLineage(stage.id)}", isSSparkLogEnabled) //
     //logInfoSSP(s"Lineages ${sc.lineages}")
     if (rddTime.size > 0 || rddSize.size > 0)
       makeSaveForm(stage, rddTime, rddSize)
@@ -2075,6 +2087,9 @@ private[spark] class DAGScheduler(
       logErrorSSP(s"Nothing in rddTime:${rddTime} or rddSize:${rddSize}")
     
   }
+
+  val opTimePerIn = HashSet[(String, Long, Long)]()
+  val opOutPerIn = HashSet[(String, Long, Long)]()
 
   // SSPARK: make "time per input size" & "output size per input size"
   private def makeSaveForm(stage: Stage, rddTime: HashMap[Int, Long], rddSize: HashMap[Int, Long]): Unit = {
@@ -2086,10 +2101,10 @@ private[spark] class DAGScheduler(
           may start from lineage.head and when meet recoginized operation (sc)
     */
     
-    val lineage = sc.lineages.get(stage.id).get
+    val lineage = sc.getLineage(stage.id)
     val accum = stage.latestInfo.accumulables
-    val opTimePerIn = HashSet[(String, Long, Long)]()
-    val opOutPerIn = HashSet[(String, Long, Long)]()
+    opTimePerIn.clear()
+    opOutPerIn.clear()
 
     val accumInputBytes = accum.find(x => x._2.name == Some(InternalAccumulator.input.BYTES_READ)) match {
       case Some(x) => x._2.value.get.asInstanceOf[Long]
@@ -2177,7 +2192,9 @@ private[spark] class DAGScheduler(
         val pId = x._2.deps.last
         
         // -1 is from stage, -2 is from job, 0 is from read file
-        if (pId == -1 || pId == -2 || pId == 0) { // in this case, input size should be shuffle or inputBytes
+        if (pId == -1 || pId == -2 || //pId == 0){
+              (pId == 0 && isHadoopRDD(x._2.name)) ) 
+              { // in this case, input size should be shuffle or inputBytes
           val in = if (accumInputBytes != 0L) accumInputBytes
           else if (accumShuffleBytes != 0L) accumShuffleBytes
           else {
@@ -2305,7 +2322,7 @@ private[spark] class DAGScheduler(
       fw.write(s"${x._1}, ${inMB}, ${outMB}\n") 
       fw.close()
     }
-    sc.opOutPerInAccum ++= opOutPerIn
+    //sc.opOutPerInAccum = opOutPerIn
     opTimePerIn.foreach{x =>
       val fw = getFileWriter(x._1, "time")
       val inMB = x._2.toFloat / Math.pow(2,20)
@@ -2313,8 +2330,8 @@ private[spark] class DAGScheduler(
       fw.write(s"${x._1}, ${inMB}, ${timeS}\n") 
       fw.close()
     }
-    sc.opTimePerInAccum ++= opTimePerIn
-
+    //sc.opTimePerInAccum = opTimePerIn
+    //doesn't need to 
   }
 
   /**
